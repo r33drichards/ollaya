@@ -22,6 +22,9 @@ Delegated to upstream code, so it cannot drift:
 Re-stated here: the temperature pick and softmax (VLMAgent._checkpoint_temperature, predict).
 
 Ollaya uses one option order per question (`predict(n_permutations=1)`, the default).
+
+Ollaya option: `resize=False` skips image resizing (`unresized_pixels`). Upstream's `predict` has no such
+switch, so those cases are checked against the network fed the processor's `do_resize=False` pixels.
 """
 import copy
 import hashlib
@@ -133,9 +136,37 @@ def image_digest(pv: torch.Tensor) -> Dict[str, Any]:
 # --------------------------------------------------------------------------------------------- rows
 
 
-def encode(agent, state: Any, questions: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+class ImageSizeError(ValueError):
+    """`resize=False` with an image that is not the model's input size (the runtime's 400 `image_size`)."""
+
+
+def unresized_pixels(agent, images: List) -> torch.Tensor:
+    """`resize=False`: every image must already be `image_size` square; its pixels are only normalised.
+
+    This is the checkpoint's own processor with `do_resize=False`, which leaves an image of the model's input
+    size untouched (checked here: the result must equal the decoded pixels normalised as the processor does it,
+    `(v - 127.5) / 127.5` in float32, bit for bit).
+    For any other size that processor still resizes, by a path the default one never takes; the runtime rejects
+    those instead of porting a second resampler.
+    """
+    S = agent.prep.image_size
+    for n, im in enumerate(images):
+        w, h = im.size if hasattr(im, "size") and not isinstance(im, np.ndarray) else (im.shape[1], im.shape[0])
+        if (w, h) != (S, S):
+            raise ImageSizeError("image %d is %dx%d; with resize off it must be %dx%d" % (n, w, h, S, S))
+    out = agent.processor.image_processor(images=[list(images)], do_image_splitting=False, do_resize=False,
+                                          return_tensors="pt")
+    pv = out["pixel_values"][0]
+    raw = torch.stack([torch.from_numpy(np.array(im, dtype=np.uint8)).permute(2, 0, 1) for im in images])
+    if not torch.equal(pv.to(torch.float32), (raw.to(torch.float32) - 127.5) / 127.5):
+        raise AssertionError("the processor with do_resize=False changed a %dx%d image" % (S, S))
+    return pv
+
+
+def encode(agent, state: Any, questions: Dict[str, Dict[str, Any]], resize: bool = True) -> Dict[str, Any]:
     """The rows `VLMAgent.predict` builds (one option order), plus the request's pixels.
 
+    `resize=False` is Ollaya's option to skip image resizing (see `unresized_pixels`); the rows are the same.
     Returns {"items": [{qid, qtype, labels, ids, markers, option_span, truncation}], "pixel_values": [I,3,S,S]
     or None, "images": [digest per image], "state_text"}.
     """
@@ -144,6 +175,8 @@ def encode(agent, state: Any, questions: Dict[str, Dict[str, Any]]) -> Dict[str,
     common = sys.modules["laya_vision.common"]
     images, text = vlm.split_state(state)
     prefix = vlm.vlm_prefix(agent.processor, images, agent.prep)
+    if images and not resize:
+        prefix = dict(prefix, pixel_values=unresized_pixels(agent, images))
     max_len, head_max_len = agent.cfg.get("max_len", 1024), agent.cfg.get("head_max_len", 256)
     items: List[Dict[str, Any]] = []
     for qid, qdef in questions.items():
@@ -257,7 +290,7 @@ def main():
     from . import cases as vcases
 
     agent = load("cpu")
-    cid, state, qs = vcases.cases()[0]
+    cid, state, qs, _ = vcases.cases()[0]
     enc = encode(agent, vcases.materialize(state), qs)
     lg, act = forward(agent, enc)
     ans = agent.predict(vcases.materialize(state), qs)["answers"]

@@ -98,7 +98,7 @@ def vision_positions(agent) -> torch.Tensor:
 
 def sample_inputs(agent):
     """A real request with two images and rows of different lengths and marker counts."""
-    _, state, qs = next(c for c in vcases.cases() if c[0] == "lv/two_images")
+    _, state, qs, _ = next(c for c in vcases.cases() if c[0] == "lv/two_images")
     qs = dict(qs, clutter=vcases.CLUTTER_Q)
     enc = ref.encode(agent, vcases.materialize(state), qs)
     b = ref.collate(enc, agent.processor.tokenizer.pad_token_id, MIN_MARKERS)
@@ -172,6 +172,9 @@ def export(out_dir: str) -> str:
         "image": {
             "state_keys": ["image", "images"],
             "size": agent.prep.image_size,
+            # Ollaya option: `options.resize` (default true) / `PARAMETER resize false`. Off, every image must
+            # already be size x size and is only normalised; see docs/families/laya-vision.md.
+            "resize_default": True,
             "stage1_longest_edge": 2048,
             "resample": "lanczos3-antialias (torchvision, uint8 rounded and clamped after each hop)",
             "processor_class": type(ip).__name__,

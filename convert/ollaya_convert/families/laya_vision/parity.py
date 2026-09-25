@@ -10,6 +10,9 @@ Three checks per question:
                 upstream network run one unpadded row at a time in float64 (`ref.Exact`; `--precision fp32`
                 for upstream's own fp32 forward): logits, act logits, calibrated probabilities, argmax.
   3. upstream   the reference's calibrated probabilities against `VLMAgent.predict` (rounded to 4 dp).
+                Requests with `options.resize = false` have no upstream `predict` equivalent; for those it
+                reports instead how far skipping the resize moves the answers (reference, resize off vs on),
+                and checks that `cases.rejected()` requests fail with `image_size`.
 """
 import argparse
 import json
@@ -57,10 +60,12 @@ def main():
     worst = []
     n_q = agree = layout_ok = 0
     up_n = up_agree = 0
+    skip_n = skip_agree = 0
     t_ort = 0.0
-    for cid, state, questions in vcases.cases():
+    for cid, state, questions, opts in vcases.cases():
         state, questions = wire(state), wire(questions)
-        enc = ref.encode(agent, vcases.materialize(state), questions)
+        resize = opts.get("resize", True)
+        enc = ref.encode(agent, vcases.materialize(state), questions, resize=resize)
         for it in enc["items"]:
             mine = layout.encode_row(encode, state, questions[it["qid"]], agent.cfg["max_len"], agent.cfg["head_max_len"])
             ok = (mine["ids"] == it["ids"] and mine["markers"] == it["markers"]
@@ -76,7 +81,12 @@ def main():
         masked = got_l[~b["marker_mask"]]
         if masked.size and not np.all(masked == -1e4):
             raise AssertionError("masked slots must be -1e4")
-        answers = None if a.no_upstream else agent.predict(vcases.materialize(state), questions)["answers"]
+        answers = None
+        if resize and not a.no_upstream:
+            answers = agent.predict(vcases.materialize(state), questions)["answers"]
+        on_l = None
+        if not resize and enc["pixel_values"] is not None:
+            on_l, _ = ref.forward(agent, ref.encode(agent, vcases.materialize(state), questions), exact)
         for r, it in enumerate(enc["items"]):
             k = len(it["markers"])
             stats["logit"].append(float(np.abs(got_l[r, :k] - ref_l[r][:k]).max()))
@@ -89,6 +99,11 @@ def main():
             agree += same
             stats["prob/%d" % it["qtype"]].append(d)
             worst.append((d, cid, it["qid"], same))
+            if on_l is not None:
+                p_on = ref.probabilities(agent, it, on_l[r])
+                skip_n += 1
+                skip_agree += int(p_on.argmax() == p_ref.argmax())
+                stats["skip_resize_prob"].append(float(np.abs(p_on - p_ref).max()))
             if answers is not None:
                 ans = answers[it["qid"]]
                 if "probabilities" in ans:
@@ -99,15 +114,28 @@ def main():
                 up_agree += int(p_up.argmax() == p_ref.argmax() or np.abs(p_up - p_ref).max() < 1e-4)
                 stats["upstream_prob"].append(float(np.abs(p_up - p_ref).max()))
 
+    rejected_ok = 0
+    for cid, state, questions, opts, issue in vcases.rejected():
+        try:
+            ref.encode(agent, vcases.materialize(wire(state)), wire(questions), resize=opts.get("resize", True))
+        except ref.ImageSizeError:
+            rejected_ok += 1
+        else:
+            print("  NOT REJECTED %s" % cid)
+
     n_rows = n_q
     print("questions: %d   ort time: %.1fs (%s)" % (n_q, t_ort, a.provider))
     print("layout.py + tokenizer.json (Rust core) reproduce upstream rows: %d/%d" % (layout_ok, n_rows))
     print("argmax agreement  onnx vs %s reference: %.4f" % (a.precision, agree / n_q))
     if up_n:
         print("reference vs VLMAgent.predict (4 dp): %d questions, argmax agreement %.4f" % (up_n, up_agree / up_n))
+    if skip_n:
+        print("resize off vs on (reference, 512x512 images): %d questions, same answer %d/%d"
+              % (skip_n, skip_agree, skip_n))
+    print("resize off, wrong size rejected: %d/%d" % (rejected_ok, len(vcases.rejected())))
     for key in sorted(stats):
         v = np.array(stats[key])
-        print("  %-14s max %.2e   p99 %.2e   mean %.2e" % (key, v.max(), np.quantile(v, 0.99), v.mean()))
+        print("  %-16s max %.2e   p99 %.2e   mean %.2e" % (key, v.max(), np.quantile(v, 0.99), v.mean()))
     print("worst probability deltas (onnx vs reference):")
     for d, cid, qid, same in sorted(worst, reverse=True)[:6]:
         print("  %.2e  %s  %s%s" % (d, cid, qid, "" if same else "  ARGMAX DIFFERS"))

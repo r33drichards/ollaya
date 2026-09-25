@@ -9,6 +9,9 @@ upscaling (smaller than 512), a single resize (between 512 and 2048), the two-ho
 2048), extreme aspect ratios, odd sizes, two images in one state, no image at all, and an image-only state.
 The sequence builder gets the same edge cases as the text families: state truncation, option-budget
 truncation, long instructions, list and dict criteria, noul with and without criteria, 10-level scores.
+
+`options` holds the request's native options; `{"resize": False}` skips image resizing, which needs every image
+to be 512x512 already. `rejected()` lists requests the runtime must refuse (a 400 naming the image).
 """
 import base64
 import io
@@ -16,7 +19,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-Case = Tuple[str, Any, Dict[str, Dict[str, Any]]]
+Case = Tuple[str, Any, Dict[str, Dict[str, Any]], Dict[str, Any]]  # (id, state, questions, options)
 
 
 def _png(img, **kw) -> str:
@@ -118,7 +121,8 @@ def cases() -> List[Case]:
                 "criteria": {"true": "a shape is visible", "false": "nothing is visible"}}
     ten = {"type": "score", "instructions": "Rate the image quality.", "criteria": ["level %d" % i for i in range(10)]}
 
-    return [
+    frame512 = _checker(512, 512, 16)
+    cases = [
         ("lv/red_circle_png", {"image": _png(red_circle)}, {"colour": COLOUR_Q, "shape": SHAPE_Q,
                                                             "has_shape": HAS_SHAPE_Q, "clutter": CLUTTER_Q}),
         ("lv/blue_square_exact512", {"image": _png(blue_square), "note": "customer photo of the part"},
@@ -146,6 +150,35 @@ def cases() -> List[Case]:
         ("lv/breakout_frame", {"image": _png(_frame())}, {"action": BREAKOUT_Q}),
         ("lv/non_ascii", {"image": _png(red_circle), "nota": "El cliente dice que llegó roto 😡 — ¿reembolso?"},
          {"colour": COLOUR_Q}),
+    ]
+    out = [(cid, st, qs, {}) for cid, st, qs in cases]
+    no_resize = {"resize": False}
+    out += [
+        ("lv/noresize_blue_square_png", {"image": _png(blue_square), "note": "customer photo of the part"},
+         {"colour": COLOUR_Q, "shape": SHAPE_Q}, no_resize),
+        ("lv/noresize_checker_png", {"image": _png(frame512)}, {"clutter": CLUTTER_Q, "has_shape": HAS_SHAPE_Q},
+         no_resize),
+        ("lv/noresize_jpeg", {"image": _jpeg(_scene(512, 512, 9, "triangle", (40, 170, 60)))},
+         {"colour": COLOUR_Q, "shape": SHAPE_Q}, no_resize),
+        ("lv/noresize_rgba_png", {"image": _png(_scene(512, 512, 10, "circle", (220, 30, 30)).convert("RGBA"))},
+         {"colour": COLOUR_Q}, no_resize),
+        ("lv/noresize_two_images", {"images": [_png(blue_square), _png(frame512)]},
+         {"colour": COLOUR_Q, "shape": SHAPE_Q}, no_resize),
+        ("lv/noresize_no_image", "A photo of a red ball on a white table.", {"colour": COLOUR_Q}, no_resize),
+    ]
+    return out
+
+
+def rejected() -> List[Tuple[str, Any, Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, Any]]]:
+    """Requests the runtime refuses: (id, state, questions, options, expected validation issue)."""
+    q = {"colour": COLOUR_Q}
+    red = _png(_scene(640, 480, 1, "circle", (220, 30, 30)))
+    sq = _png(_scene(512, 512, 2, "square", (30, 60, 210)))
+    size = lambda loc, w, h: {"loc": ["body", "state"] + loc, "type": "image_size",  # noqa: E731
+                              "ctx": {"width": 512, "height": 512, "actual_width": w, "actual_height": h}}
+    return [
+        ("lv/reject_noresize_640x480", {"image": red}, q, {"resize": False}, size(["image"], 640, 480)),
+        ("lv/reject_noresize_second_image", {"images": [sq, red]}, q, {"resize": False}, size(["images", 1], 640, 480)),
     ]
 
 

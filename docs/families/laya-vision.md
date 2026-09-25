@@ -141,8 +141,11 @@ The checkpoint's processor is `Idefics3ImageProcessor`, the torchvision backend 
 3. Round and clamp to uint8.
 4. **Resize 2 (Lanczos, antialiased):** to 512 × 512, ignoring the aspect ratio. Round and clamp
    to uint8.
-5. **Normalize:** `(v / 255 − 0.5) / 0.5` in float32, giving `pixel_values [3, 512, 512]`. The pixel
-   attention mask is all ones, so the graph does not take it.
+5. **Normalize:** `(v − 127.5) / 127.5` in float32, giving `pixel_values [3, 512, 512]`. This is
+   the processor's own arithmetic, bit for bit; `(v / 255 − 0.5) / 0.5` is the same map but is off by
+   one ulp on some values. The pixel attention mask is all ones, so the graph does not take it.
+
+Steps 2–4 are the default. `resize: false` skips them ([below](#resize-is-optional)).
 
 **The resampler must be torchvision's, not PIL's.** The fast processor calls
 `torchvision.transforms.v2.functional.resize(..., LANCZOS, antialias=True)` on a uint8 tensor
@@ -163,6 +166,46 @@ so the Rust preprocessing is tested bit for bit, separately from the network. `-
 them as `.npy` for debugging. JPEG decoding is a second risk: Rust decoders are not guaranteed to
 match libjpeg-turbo to the bit, and one golden case is a JPEG. If that case is off by a grey level,
 the fix is a bit-exact decoder, never a tolerance.
+
+### Resize is optional
+
+Resizing is **on by default**: it is the path the checkpoint was trained and evaluated on. A caller
+can turn it off when its images are already the model's input size. Two typical cases are game
+frames rendered at 512×512, and images a pipeline has already resized. Turning it off:
+
+- skips steps 2–4, including the 2048-pixel intermediate: the most expensive part of preprocessing,
+  12.7 ms of CPU for a 210×160 frame, as upstream measured it;
+- requires **every** image in the request to be exactly 512×512 after decoding. Any other size is
+  refused with a 400 `image_size` issue that names the image (`loc` `["body","state","image"]` or
+  `["body","state","images",n]`, `ctx`
+  `{"width": 512, "height": 512, "actual_width": w, "actual_height": h}`). Ollaya does not pad, crop
+  or fall back to a resize. For any other size, the processor's own `do_resize=False` path still
+  resizes, by a route the default never takes. Rejecting avoids porting a second resampler whose
+  output no checkpoint number describes.
+- sends the decoded pixels, only normalized, to the graph. This is the checkpoint's own processor
+  with `do_resize=False`, which leaves a 512×512 image untouched (`ref.unresized_pixels` checks that
+  bit for bit on every golden). Rows, graph and calibration do not change.
+
+How to set it:
+
+| Where | How |
+|---|---|
+| `/api/decide` | `"options": {"resize": false}`. This is the first key of the optional `options` object that §7.3 of `docs/api.md` reserves. Other keys are `enum` issues; `resize` on a model without images is ignored. |
+| Modelfile | `PARAMETER resize false`, next to `PARAMETER precision`, for a derived model such as `FROM laya-vision` / `PARAMETER resize false`. This is how `/v1/*` callers get it, because `/v1/*` stays TypeSafe-identical and takes no native options. A request's `options.resize` wins over the model's parameter. |
+| CLI | `ollaya run laya-vision --image frame.png --no-resize …` |
+| MCP | `decide` takes `resize` (boolean) next to `images`. |
+
+**What skipping costs.** Resizing a 512×512 image is not the identity: 512 → 2048 → 512 softens it
+slightly. So with resize off the model sees sharper pixels than it was trained on. Measured with the
+reference (backbone in float64) on the golden cases, resize off against on:
+
+| Image (512×512) | Largest probability change | Answer |
+|---|---|---|
+| photo-like scenes: PNG, JPEG, RGBA, two images (7 questions) | 0.002–0.044 | same |
+| 16-pixel checkerboard, all hard edges (2 questions) | 0.07, 0.18 | changed on 1 of 2 (`clutter` level 0 instead of 1) |
+
+That is why the default stays on. Turn it off for speed on images that are already 512×512, and
+expect the most change on synthetic, hard-edged content.
 
 ## ONNX contract (V)
 
@@ -231,7 +274,7 @@ Laya's, unchanged. `service.rs` needs no new code for this family.
 
 `uv run --with pillow --with 'torchvision==0.29.*' python -m ollaya_convert.families.laya_vision.parity out/laya-vision-wl`
 
-The set is 20 requests and 30 questions (`cases.py`), all with synthetic images generated
+The set is 26 requests and 40 questions (`cases.py`), all with synthetic images generated
 deterministically:
 
 - PNG in RGB, RGBA, greyscale and palette, plus a JPEG;
@@ -239,7 +282,9 @@ deterministically:
   a 1200×40 strip;
 - two images in one state, `image` and `images` together, and text-only states;
 - state truncation, the option budget, long instructions, 10-level scores, an Atari frame, and
-  non-ASCII text.
+  non-ASCII text;
+- six requests with `resize: false` (PNG, JPEG, RGBA, a checkerboard, two images, no image), plus
+  two it must reject (`cases.rejected()`).
 
 The reference is upstream's network, one unpadded row at a time, with the backbone in float64
 (`ref.Exact`). The head stays in fp32 because upstream casts to fp32 before it. ONNX ran on the CPU
@@ -247,12 +292,14 @@ EP, ONNX Runtime 1.30, one padded batch per request.
 
 | Check | Result |
 |---|---|
-| `layout.py` + `tokenizer.json` (Rust core) vs upstream rows (ids, markers, option span) | 30/30 identical |
-| argmax, ONNX vs reference | 30/30 |
-| option logits, max abs | 7.6e-5 (p99 6.7e-5) |
+| `layout.py` + `tokenizer.json` (Rust core) vs upstream rows (ids, markers, option span) | 40/40 identical |
+| argmax, ONNX vs reference | 40/40 |
+| option logits, max abs | 7.6e-5 (p99 6.4e-5) |
 | act logits, max abs | 1.4e-5 |
-| probabilities, max abs | choice 7.2e-7, score 2.8e-6, noul 6.5e-6 |
-| reference vs `VLMAgent.predict` (4 dp) | 30/30, max 4.9e-5 (predict's rounding and fp32 backbone) |
+| probabilities, max abs | choice 1.1e-6, score 2.8e-6, noul 6.5e-6 |
+| reference vs `VLMAgent.predict` (4 dp), resize-on requests | 30/30, max 4.9e-5 (predict's rounding and fp32 backbone) |
+| resize-off requests (10 questions, 6 requests), ONNX vs reference | 10/10 argmax; included in the rows above |
+| resize off with a wrong-sized image rejected | 2/2 |
 
 - Before export, the graph module run eagerly matched the reference to 0.0 on single-row requests
   and 2.8e-5 on padded batches.
@@ -261,15 +308,18 @@ EP, ONNX Runtime 1.30, one padded batch per request.
   vision tower's LayerNorms and the `finfo.min` mask are the usual fp16 suspects.
 
 Goldens: `python -m ollaya_convert.families.laya_vision.goldens` writes
-`out/goldens-laya-vision.jsonl` (20 cases, 6.6 MB) in about 1 minute on 4 CPU cores. Each line
-holds:
+`out/goldens-laya-vision.jsonl` (26 cases plus 2 rejections, 10.4 MB) in about 1 minute on 4 CPU
+cores. Each line holds:
 
-- the wire request, with images as data URLs;
+- the wire request, with images as data URLs, and its `options` (`{}` or `{"resize": false}`);
 - the state text;
 - per image, the sha256 of the 512×512×3 uint8 pixels;
 - per question, the row ids, markers, option span, truncation, logits, act logits, temperature and
   probabilities;
-- upstream's own `predict` answers.
+- upstream's own `predict` answers (null with resize off: upstream has no such switch).
+
+The two rejection lines hold the request and the expected `INVALID_REQUEST` body with its
+`image_size` issue.
 
 ## Runtime plan
 
@@ -286,8 +336,10 @@ holds:
 - Decode with the `image` crate (PNG, JPEG, WebP, GIF), with no EXIF rotation. Convert to RGB8 as
   PIL does.
 - A port of ATen's antialiased Lanczos (separable, float weights, uint8 round and clamp per hop),
-  run twice as above, then normalize into the `pixel_values` buffer.
-- Tests: the sha256 of every golden image's pixels, bit-exact. This is a new `image` crate
+  run twice as above, then normalize (`(v − 127.5) / 127.5`, f32) into the `pixel_values` buffer.
+- `resize = false`: check that each decoded image is 512×512, returning the `image_size` issue
+  otherwise, and normalize it directly. No resampler runs.
+- Tests: the sha256 of every golden image's pixels, bit-exact, on both paths. This is a new `image` crate
   dependency in the runner only; it's pure Rust, and the daemon does not decode images.
 
 ### 4. Wiring
@@ -303,12 +355,17 @@ holds:
 - **Server:**
   - `DefaultBodyLimit` on the daemon's and the runner's routers;
   - image count and pixel guards return 400s with the existing `{error}` body;
+  - `DecideRequest` gains an optional `options: {resize?: bool}` (unknown keys are `enum` issues).
+    The server resolves the value (request, else the model's `resize` parameter, else true) and
+    passes it to the runner's `/decide` next to `state`.
+  - `Modelfile` and `/api/create` accept `PARAMETER resize true|false`. It is stored in the model's
+    `params` layer, like `precision`.
   - `usage.images` goes on `/api/decide` only.
 - **CLI:** `ollaya run <model> --image PATH` (repeatable) builds `{"image": …}` or
-  `{"images": […]}` plus the prompt text as `"text"`. `ollaya show` lists "vision" under
+  `{"images": […]}` plus the prompt text as `"text"`. `--no-resize` sets `options.resize = false`. `ollaya show` lists "vision" under
   capabilities.
-- **MCP:** the `decide` tool gains an `images` argument (paths or data URLs) that the tool turns
-  into data URLs before calling the daemon.
+- **MCP:** the `decide` tool gains an `images` argument (paths or data URLs), which the tool turns
+  into data URLs before calling the daemon, and a `resize` boolean.
 - **Registry and manifest:** no new media types. The `decision` layer carries the image settings;
   `ModelConfig.family` is `laya-vision`.
 - **Precision:** fp32 on CPU and fp16 on GPU, as for Laya, once fp16 parity is measured. Until then,
