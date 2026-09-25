@@ -51,8 +51,13 @@ def load_tensor(path, entry):
         return np.frombuffer(f.read(length), dtype=np_dtype).reshape(shape)
 
 
-def rewrite(model, checkpoint, prefix="", location="model.safetensors"):
-    """Rewrite `model` in place so its weights reference `checkpoint`; returns stats."""
+def rewrite(model, checkpoint, prefix="", location="model.safetensors", small_transposes=False):
+    """Rewrite `model` in place so its weights reference `checkpoint`; returns stats.
+
+    Pre-transposed weights are matched by value only above 4096 elements, where a coincidental match is
+    implausible. `small_transposes` also matches smaller 2-D ones (e.g. a [d, 1] output projection), but only
+    when exactly one unused checkpoint tensor has the transposed shape and equal values.
+    """
     index = read_safetensors_index(checkpoint)
     graph = model.graph
     by_shape = {}
@@ -74,6 +79,11 @@ def rewrite(model, checkpoint, prefix="", location="model.safetensors"):
                 if np.array_equal(load_tensor(checkpoint, index[cand]).T.astype(arr.dtype), arr):
                     source, transpose = cand, True
                     break
+        elif small_transposes and arr.ndim == 2 and arr.size > 1:
+            hits = [c for c in by_shape.get(arr.shape[::-1], []) if c not in used and
+                    np.array_equal(load_tensor(checkpoint, index[c]).T.astype(arr.dtype), arr)]
+            if len(hits) == 1:
+                source, transpose = hits[0], True
         if source is None or index[source][0] not in ST_DTYPES or ST_DTYPES[index[source][0]][0] is None:
             kept.append(init)
             stats["inline"] += 1
@@ -121,10 +131,12 @@ def main():
     ap.add_argument("--prefix", default="", help="prefix the exporter added to parameter names")
     ap.add_argument("--location", default="model.safetensors",
                     help="file name the graph uses for the checkpoint, relative to model.onnx")
+    ap.add_argument("--small-transposes", action="store_true",
+                    help="also reference pre-transposed 2-D weights of 4096 elements or fewer (unique value match)")
     a = ap.parse_args()
 
     model = onnx.load(os.path.join(a.src, "model.onnx"), load_external_data=True)
-    stats = rewrite(model, a.checkpoint, a.prefix, a.location)
+    stats = rewrite(model, a.checkpoint, a.prefix, a.location, a.small_transposes)
     os.makedirs(a.out, exist_ok=True)
     out = os.path.join(a.out, "model.onnx")
     onnx.save(model, out)  # external initializers stay references; nothing is copied
