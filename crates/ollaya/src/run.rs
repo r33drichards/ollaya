@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use indicatif::ProgressBar;
 use ollaya_api::{Client, DecideRequest, DecideResponse, KeepAlive, Questions};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
 
 use crate::{commands, daemon, presets, render};
@@ -44,6 +45,11 @@ pub struct RunArgs {
     /// Parse the state as JSON (an object or array). JSON input is otherwise detected.
     #[arg(long)]
     pub state_json: bool,
+    /// An image to decide about, for vision models. Repeat the flag for several images; they are
+    /// sent in the order given, as the state's `images` list. Without a state, the images alone
+    /// are the state.
+    #[arg(long = "image", value_name = "FILE")]
+    pub images: Vec<PathBuf>,
 }
 
 fn parse_keep_alive(s: &str) -> Result<KeepAlive, String> {
@@ -65,6 +71,66 @@ pub fn parse_state(text: &str, force_json: bool) -> Result<Value> {
     Ok(Value::String(
         text.trim_end_matches(['\n', '\r']).to_owned(),
     ))
+}
+
+/// The image type from a file's first bytes; the file name is not trusted.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+/// An image file as a `data:` URL, the form images take inside a state.
+pub fn image_data_url(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let Some(mime) = image_mime(&bytes) else {
+        bail!("{}: not a PNG, JPEG, WebP or GIF image", path.display());
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}
+
+/// Attach images (data URLs, in `--image` order) to a state as its `images` list.
+///
+/// Text becomes `{"images": [...], "text": ...}` (just the images when the text is empty); an
+/// object gains an `images` key in front of its own keys. An object that already carries images,
+/// or an array, is refused: the order would be ambiguous, or there is no place for them.
+pub fn attach_images(state: Value, images: &[String]) -> Result<Value> {
+    if images.is_empty() {
+        return Ok(state);
+    }
+    let mut out = Map::new();
+    out.insert(
+        "images".to_owned(),
+        Value::Array(images.iter().cloned().map(Value::String).collect()),
+    );
+    match state {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                out.insert("text".to_owned(), Value::String(text));
+            }
+        }
+        Value::Object(map) => {
+            if map.contains_key("image") || map.contains_key("images") {
+                bail!(
+                    "the state already has an \"image\" or \"images\" key; put every image there or pass them all with --image"
+                );
+            }
+            out.extend(map);
+        }
+        _ => bail!("--image needs a text or JSON object state, not a JSON array"),
+    }
+    Ok(Value::Object(out))
 }
 
 fn load_questions(path: &Path) -> Result<Questions> {
@@ -111,10 +177,14 @@ struct Session {
     format: Format,
     verbose: bool,
     state_json: bool,
+    /// `--image` files, in the order given, and their `data:` URLs.
+    image_paths: Vec<PathBuf>,
+    images: Vec<String>,
 }
 
 impl Session {
     async fn decide(&self, state: Value) -> Result<DecideResponse> {
+        let state = attach_images(state, &self.images)?;
         let mut req = DecideRequest::new(&self.model, state, self.questions.clone());
         req.keep_alive = self.keep_alive;
         Ok(self.client.decide(&req).await?)
@@ -149,7 +219,14 @@ impl Session {
 }
 
 pub fn run(rt: &Runtime, args: RunArgs) -> Result<()> {
-    let session = rt.block_on(prepare(&args))?;
+    // Read the images first, so a bad path fails before the daemon starts or a model is pulled.
+    let images = args
+        .images
+        .iter()
+        .map(|p| image_data_url(p))
+        .collect::<Result<Vec<_>>>()?;
+    let mut session = rt.block_on(prepare(&args))?;
+    session.images = images;
     let piped = !std::io::stdin().is_terminal();
     let state = if !args.state.is_empty() {
         Some(args.state.join(" "))
@@ -159,6 +236,9 @@ pub fn run(rt: &Runtime, args: RunArgs) -> Result<()> {
             .read_to_string(&mut s)
             .context("reading the state from stdin")?;
         Some(s)
+    } else if !session.images.is_empty() {
+        // Images and no text: decide about the images alone.
+        Some(String::new())
     } else {
         None
     };
@@ -204,6 +284,8 @@ async fn prepare(args: &RunArgs) -> Result<Session> {
         format: args.format,
         verbose: args.verbose,
         state_json: args.state_json,
+        image_paths: args.images.clone(),
+        images: Vec::new(),
     })
 }
 
@@ -249,6 +331,12 @@ fn parse_command(line: &str) -> Option<Command> {
 
 fn describe(session: &Session) -> String {
     let mut out = format!("model: {}\n", session.model);
+    if !session.image_paths.is_empty() {
+        out.push_str("images (sent with every state, in this order):\n");
+        for (i, p) in session.image_paths.iter().enumerate() {
+            out.push_str(&format!("  {}: {}\n", i + 1, p.display()));
+        }
+    }
     match &session.questions {
         None => out.push_str("questions: the model's built-in set\n"),
         Some(q) => {
@@ -364,6 +452,68 @@ mod tests {
     }
 
     #[test]
+    fn image_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        assert_eq!(
+            image_data_url(&png).unwrap(),
+            "data:image/png;base64,iVBORw0KGgpyZXN0"
+        );
+        // The type comes from the bytes, not the name.
+        let jpeg = dir.path().join("b.png");
+        std::fs::write(&jpeg, [0xff, 0xd8, 0xff, 0xe0]).unwrap();
+        assert!(
+            image_data_url(&jpeg)
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
+        let webp = dir.path().join("c");
+        std::fs::write(&webp, b"RIFF\0\0\0\0WEBPVP8 ").unwrap();
+        assert!(
+            image_data_url(&webp)
+                .unwrap()
+                .starts_with("data:image/webp;base64,")
+        );
+        let text = dir.path().join("d.png");
+        std::fs::write(&text, b"hello").unwrap();
+        let err = image_data_url(&text).unwrap_err().to_string();
+        assert!(err.contains("not a PNG"), "{err}");
+        assert!(image_data_url(&dir.path().join("missing.png")).is_err());
+    }
+
+    #[test]
+    fn images_in_argument_order() {
+        let imgs = [
+            "data:a".to_owned(),
+            "data:b".to_owned(),
+            "data:c".to_owned(),
+        ];
+        assert_eq!(
+            attach_images(json!("it arrived broken"), &imgs).unwrap(),
+            json!({"images": ["data:a", "data:b", "data:c"], "text": "it arrived broken"})
+        );
+        assert_eq!(
+            attach_images(json!(""), &imgs[..1]).unwrap(),
+            json!({"images": ["data:a"]})
+        );
+        let obj = attach_images(json!({"note": "n", "order": 7}), &imgs[1..]).unwrap();
+        assert_eq!(
+            obj,
+            json!({"images": ["data:b", "data:c"], "note": "n", "order": 7})
+        );
+        assert_eq!(
+            obj.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["images", "note", "order"]
+        );
+        assert!(attach_images(json!({"image": "x"}), &imgs).is_err());
+        assert!(attach_images(json!({"images": []}), &imgs).is_err());
+        assert!(attach_images(json!([1, 2]), &imgs).is_err());
+        // Without --image nothing changes.
+        assert_eq!(attach_images(json!([1, 2]), &[]).unwrap(), json!([1, 2]));
+    }
+
+    #[test]
     fn repl_commands() {
         assert!(matches!(parse_command("/bye"), Some(Command::Bye)));
         assert!(matches!(parse_command(" /? "), Some(Command::Help)));
@@ -386,6 +536,7 @@ mod tests {
             keepalive: None,
             verbose: false,
             state_json: false,
+            images: vec![],
         };
         assert!(choose_questions(&args(None, None), true).unwrap().is_none());
         assert!(

@@ -76,7 +76,8 @@ TypeSafe. The convention is upstream's own (`laya.vlm.split_state`):
 - An image is a `data:` URL (`data:image/png;base64,…`); plain base64 without the prefix is also
   accepted. Formats: PNG, JPEG, WebP and GIF (first frame).
 - The daemon never fetches a URL or reads a path. The CLI and the MCP tool read files and send
-  data URLs (`ollaya run laya-vision --image photo.jpg "note"`).
+  data URLs. `ollaya run laya-vision --image a.jpg --image b.jpg "note"` sends
+  `{"images": [a, b], "text": "note"}`, with the images in argument order.
 - A string, array or image-less object state is a text-only request. It works: the rows simply have
   no image run.
 - On a model without the vision layout, a state with `image`/`images` keys is just JSON text, as
@@ -361,8 +362,14 @@ The two rejection lines hold the request and the expected `INVALID_REQUEST` body
   - `Modelfile` and `/api/create` accept `PARAMETER resize true|false`. It is stored in the model's
     `params` layer, like `precision`.
   - `usage.images` goes on `/api/decide` only.
-- **CLI:** `ollaya run <model> --image PATH` (repeatable) builds `{"image": …}` or
-  `{"images": […]}` plus the prompt text as `"text"`. `--no-resize` sets `options.resize = false`. `ollaya show` lists "vision" under
+- **CLI:** `ollaya run <model> --image PATH` is **implemented** (`crates/ollaya/src/run.rs`). The
+  flag repeats, and the images always go in a `"images"` list, in argument order:
+  - text becomes `{"images": [...], "text": ...}`;
+  - an object state gains `images` ahead of its own keys;
+  - no state at all means the images alone;
+  - an array, or an object that already has `image`/`images`, is refused.
+  Files are recognised by their magic bytes (PNG, JPEG, WebP, GIF) and read before the daemon is
+  contacted. `--no-resize` (to do, with `options`) will set `options.resize = false`. `ollaya show` lists "vision" under
   capabilities.
 - **MCP:** the `decide` tool gains an `images` argument (paths or data URLs), which the tool turns
   into data URLs before calling the daemon, and a `resize` boolean.

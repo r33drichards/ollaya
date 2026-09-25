@@ -287,6 +287,34 @@ mod tests {
         assert_eq!(r.questions, Some(PathBuf::from("q.json")));
         assert_eq!(r.keepalive, Some(ollaya_api::KeepAlive::Forever));
         assert!(r.state.is_empty() && r.state_json);
+        assert!(r.images.is_empty());
+        // --image repeats, and the images keep the order they were given in.
+        let Some(Command::Run(r)) = parse(&[
+            "run",
+            "laya-vision",
+            "--image",
+            "b.png",
+            "--preset",
+            "triage",
+            "--image",
+            "a.jpg",
+            "--image=c.webp",
+            "compare",
+            "them",
+        ])
+        .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            r.images,
+            [
+                PathBuf::from("b.png"),
+                PathBuf::from("a.jpg"),
+                PathBuf::from("c.webp")
+            ]
+        );
+        assert_eq!(r.state.join(" "), "compare them");
     }
 
     #[test]
