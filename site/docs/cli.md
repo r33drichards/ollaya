@@ -55,6 +55,8 @@ ollaya run laya --preset triage "I was charged twice for my subscription this mo
 | `--keepalive DURATION` | How long to keep the model loaded afterwards: `5m`, `1h`, `0` (unload now), `-1` (keep loaded) |
 | `--verbose` | Also print every option's probability, the routing decision and the timings |
 | `--state-json` | Parse the state as JSON. A state that looks like a JSON object or array is detected anyway |
+| `--image FILE` | Add an image, for image-input models. Repeat it for several images; they are sent in the order given |
+| `--no-resize` | Send images as they are instead of resizing them; each must already be the model's input size (512×512) |
 
 Where the questions come from, first match wins: `--questions`, then `--preset`, then questions built into the model with a Modelfile. A model with none needs one of the flags.
 
@@ -63,6 +65,14 @@ Where the questions come from, first match wins: `--questions`, then `--preset`,
 ```shell
 cat ticket.txt | ollaya run laya --preset triage
 ```
+
+**Images.** Each `--image` file (PNG, JPEG, WebP or GIF, recognised by its content) is sent inside the state as a `data:` URL, in an `images` list in the order of the flags:
+
+```shell
+ollaya run laya-vision --image before.jpg --image after.jpg --questions damage.json "customer says it arrived broken"
+```
+
+sends the state `{"images": ["data:image/jpeg;base64,…", "data:image/jpeg;base64,…"], "text": "customer says it arrived broken"}`. With a JSON object state, `images` is added to it, ahead of the object's own keys. With no state at all, the images alone are the state. A JSON array state, or an object that already has an `image` or `images` key, can't be combined with `--image`. At the prompt, the images go with every state you type, and `/show` lists them.
 
 On a terminal without a state, `run` opens a prompt. Type a state and press Enter; wrap several lines in `"""`. Commands:
 

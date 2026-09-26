@@ -163,6 +163,7 @@ pub fn error_body(e: &Error, pulling: bool) -> ErrorBody {
         Error::NoQuestions(_) => {
             ErrorBody::invalid_request(vec![ValidationIssue::missing(body_loc(&["questions"]))])
         }
+        Error::InvalidInput(issues) => ErrorBody::invalid_request(issues.clone()),
         Error::InvalidRequest(m) => ErrorBody::invalid_request(vec![ValidationIssue::new(
             vec![Loc::key("body")],
             "value_error",
@@ -464,6 +465,7 @@ async fn create(State(s): State<Arc<AppState>>, body: Body) -> ApiResult<Respons
             .as_ref()
             .map(|c| serde_json::to_value(c).expect("calibration serializes")),
         precision: req.parameters.as_ref().and_then(|p| p.precision.clone()),
+        resize: req.parameters.as_ref().and_then(|p| p.resize),
         license: req.license.as_ref().map(|l| l.text()),
         description: req.description.clone(),
     };
@@ -584,6 +586,7 @@ async fn decide(State(s): State<Arc<AppState>>, body: Body) -> ApiResult<Json<De
             .as_ref()
             .map(ollaya_api::decide::engine_questions),
         keep_alive: req.keep_alive,
+        options: req.options.clone(),
         cancel: None,
     };
     let out = run_decision(&s, input)
@@ -609,6 +612,7 @@ async fn systemone(
             .as_ref()
             .map(ollaya_api::decide::engine_questions),
         keep_alive: None,
+        options: Default::default(),
         cancel: None,
     };
     let out = run_decision(&s, input)

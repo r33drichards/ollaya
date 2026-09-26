@@ -32,7 +32,7 @@ order: 3
 
 ## Conventions
 
-- **JSON.** Request and response bodies are JSON objects. The body is parsed as JSON whatever its `Content-Type`, so `curl -d` works as is. Requests are at most 8 MiB.
+- **JSON.** Request and response bodies are JSON objects. The body is parsed as JSON whatever its `Content-Type`, so `curl -d` works as is. Requests are at most 32 MiB.
 - **Field names** are `snake_case`. Unknown request fields are ignored; `null` means absent.
 - **Model names** are `[host/][namespace/]model[:tag]`, case-insensitive. A missing tag means `latest`. Responses always use the canonical form, such as `laya:latest`.
 - **Numbers.** Probabilities, confidences, `score` and `noul` are rounded to 4 decimal places. Durations are integers in nanoseconds; timestamps are RFC 3339 in UTC.
@@ -69,7 +69,7 @@ Every error, on every endpoint, has this body:
 | `NOT_FOUND` | 404 | No such endpoint | no |
 | `METHOD_NOT_ALLOWED` | 405 | Endpoint exists, method doesn't | no |
 | `OPERATION_IN_PROGRESS` | 409 | A pull or create is writing the same model name | after it finishes |
-| `REQUEST_TOO_LARGE` | 413 | Body over 8 MiB | no |
+| `REQUEST_TOO_LARGE` | 413 | Body over 32 MiB | no |
 | `QUEUE_FULL` | 503 | `OLLAYA_MAX_QUEUE` requests already waiting; sent with `Retry-After: 1` | yes |
 | `MODEL_LOAD_FAILED` | 500 | The model could not load (corrupt files, memory, `OLLAYA_LOAD_TIMEOUT`) | rarely |
 | `INFERENCE_FAILED` | 500 | The runner failed during a decision | yes |
@@ -152,6 +152,7 @@ Answers typed questions about a state in one forward pass. The body is the `/v1/
 | `questions` | object | yes, unless the model has built-in questions | Replaces the model's own questions entirely |
 | `keep_alive` | string or number | no | See [keep_alive](#keep-alive) |
 | `extras` | array of strings | no | `["laya"]` adds laya's own confidence and act probability to every answer |
+| `options` | object | no | `{"resize": false}`: image-input models take images that are already their input size (512×512) as they are, instead of resizing them |
 | `stream` | boolean | no | Reserved; `true` is rejected |
 
 ```shell
@@ -380,7 +381,7 @@ The API behind `ollaya create -f Modelfile`: the CLI reads the Modelfile and the
 | `from` | string | yes | A local model, possibly a router. It is never pulled. |
 | `questions` | object | no | Built-in questions, validated like a decision request |
 | `calibration` | object | no | `temperature`: up to 3 numbers (choice, score, noul). `temperature_by_options`: `"<type>:<2\|3-5\|6-10\|11+>"` → number. |
-| `parameters` | object | no | `precision`: `"fp16"` or `"fp32"`, to pin one graph |
+| `parameters` | object | no | `precision`: `"fp16"` or `"fp32"`, to pin one graph. `resize`: `false` makes an image-input model take 512×512 images as they are by default |
 | `license` | string or array | no | License text(s) |
 | `description` | string | no | One line, shown by `/v1/models` and `ollaya show` |
 | `stream` | boolean | no | Default `true` |

@@ -42,6 +42,12 @@ fn pinned_precision(store: &Store, manifest: &Manifest) -> Option<String> {
     params["precision"].as_str().map(str::to_owned)
 }
 
+/// `PARAMETER resize` of an image-input model, if set.
+fn pinned_resize(store: &Store, manifest: &Manifest) -> Option<bool> {
+    let params: Value = store.read_blob_json(manifest.layer(media::PARAMS)?).ok()?;
+    params["resize"].as_bool()
+}
+
 fn precision_label(p: &str) -> String {
     match p {
         "fp16" => "F16".into(),
@@ -145,10 +151,13 @@ pub fn show(store: &Store, info: &ModelInfo) -> ShowResponse {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     let precision = pinned_precision(store, manifest);
+    let resize = pinned_resize(store, manifest);
     let parameters = precision
-        .as_ref()
+        .iter()
         .map(|p| format!("precision {p}"))
-        .unwrap_or_default();
+        .chain(resize.iter().map(|r| format!("resize {r}")))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut model_info = IndexMap::new();
     model_info.insert("general.architecture".into(), json!(family));
@@ -234,6 +243,9 @@ pub fn show(store: &Store, info: &ModelInfo) -> ShowResponse {
         }
         if let Some(p) = &precision {
             modelfile.push_str(&format!("PARAMETER precision {p}\n"));
+        }
+        if let Some(r) = resize {
+            modelfile.push_str(&format!("PARAMETER resize {r}\n"));
         }
         let description = text(&c["description"]);
         if !description.is_empty() {

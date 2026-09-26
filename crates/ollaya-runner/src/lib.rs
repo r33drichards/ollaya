@@ -6,7 +6,9 @@
 pub mod decider;
 pub mod engine;
 pub mod gliclass;
+pub mod image;
 pub mod kev;
+pub mod laya_vision;
 pub mod nli;
 pub mod onnx;
 pub mod qwen3guard;
@@ -15,6 +17,15 @@ pub mod von;
 
 pub use engine::Engine;
 pub use onnx::{Device, Encoding, ModelFiles, OnnxModel};
+
+/// Per-request options a family may read; the others ignore them.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RunOptions {
+    /// Image-input models: resize images to the model's input size (the default), or use
+    /// images that already have it as they are. `None` is the model's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<bool>,
+}
 
 /// Raw network output for one question.
 #[derive(Debug, Clone)]

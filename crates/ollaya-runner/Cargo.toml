@@ -18,6 +18,10 @@ coreml = ["ort/coreml"]
 
 [dependencies]
 axum.workspace = true
+base64.workspace = true
+image.workspace = true
+mozjpeg.workspace = true
+mozjpeg-sys.workspace = true
 ollaya-decision.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -30,3 +34,5 @@ tokenizers.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+hex.workspace = true
+sha2.workspace = true

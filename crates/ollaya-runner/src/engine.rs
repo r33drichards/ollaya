@@ -11,11 +11,22 @@ use ollaya_decision::Questions;
 use serde_json::Value;
 
 use crate::onnx::{Device, ModelFiles, OnnxModel};
-use crate::{Error, Output};
+use crate::{Error, Output, RunOptions};
 
 pub trait Engine: Send + Sync {
     /// Answer every question about `state`, returning one logit per option per question.
     fn run(&self, state: &Value, questions: &Questions) -> Result<Output, Error>;
+
+    /// [`Engine::run`] with the request's options. Families without options ignore them.
+    fn run_with(
+        &self,
+        state: &Value,
+        questions: &Questions,
+        options: &RunOptions,
+    ) -> Result<Output, Error> {
+        let _ = options;
+        self.run(state, questions)
+    }
 
     /// The only questions a fixed-preset model answers (its built-in set); `None` for models
     /// that answer any typed question.
@@ -65,6 +76,7 @@ pub const LAYOUTS: &[&str] = &[
     "kev-pointer-v1",
     "qwen3guard-gen-v1",
     "von-option-marker-v1",
+    "laya-vision-terminator-v1",
 ];
 
 /// The layout a `decision` layer declares.
@@ -105,6 +117,9 @@ pub fn load(
         "von-option-marker-v1" => Ok(Box::new(crate::von::VonModel::load_files(
             files, device, threads,
         )?)),
+        "laya-vision-terminator-v1" => Ok(Box::new(
+            crate::laya_vision::LayaVisionModel::load_files(files, device, threads)?,
+        )),
         other => Err(Error::Model(format!(
             "this version of ollaya cannot run layout {other:?} (supported: {}); upgrade ollaya",
             LAYOUTS.join(", ")

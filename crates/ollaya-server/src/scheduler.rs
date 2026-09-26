@@ -78,11 +78,20 @@ pub struct RunningInfo {
 
 impl Runner {
     /// Forward a request to the runner process.
-    pub async fn decide(&self, state: &Value, questions: &Value) -> Result<Value, Error> {
+    pub async fn decide(
+        &self,
+        state: &Value,
+        questions: &Value,
+        options: &ollaya_api::DecideOptions,
+    ) -> Result<Value, Error> {
+        let mut body = serde_json::json!({"state": state, "questions": questions});
+        if !options.is_empty() {
+            body["options"] = serde_json::to_value(options).expect("options serialize");
+        }
         let resp = self
             .http
             .post(format!("http://127.0.0.1:{}/decide", self.port))
-            .json(&serde_json::json!({"state": state, "questions": questions}))
+            .json(&body)
             .send()
             .await
             .map_err(|e| Error::Runner(format!("{}: {e}", self.name)))?;
@@ -102,6 +111,14 @@ impl Runner {
                 options: err["options"].as_u64().unwrap_or(0) as usize,
                 model: self.name.clone(),
             });
+        }
+        if status.is_client_error()
+            && let Some(detail) = err.get("detail")
+            && let Ok(issues) =
+                serde_json::from_value::<Vec<ollaya_api::ValidationIssue>>(detail.clone())
+            && !issues.is_empty()
+        {
+            return Err(Error::InvalidInput(issues));
         }
         if status.is_client_error() {
             Err(Error::InvalidRequest(message))

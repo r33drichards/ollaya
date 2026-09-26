@@ -230,6 +230,10 @@ pub struct CreateParameters {
     /// Pin the graph precision: `fp16` or `fp32`. Unset, the device decides (fp16 on CUDA).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<String>,
+    /// Image-input models: resize images (the default) or use 512×512 images as they are.
+    /// A request's `options.resize` overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<bool>,
 }
 
 /// One license text or several.

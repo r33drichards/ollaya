@@ -10,6 +10,7 @@ pub mod calibration;
 pub mod decider;
 pub mod gliclass;
 pub mod kev;
+pub mod laya_vision;
 pub mod layout;
 pub mod nli;
 mod printable;
@@ -40,6 +41,10 @@ pub enum Error {
     },
     #[error("tokenizer: {0}")]
     Tokenizer(String),
+    /// A request's image is missing, malformed, undecodable or the wrong size; the issue is
+    /// the validation issue the API returns.
+    #[error("{0}")]
+    Image(Box<laya_vision::ImageIssue>),
 }
 
 impl Error {

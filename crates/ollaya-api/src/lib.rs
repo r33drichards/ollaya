@@ -23,9 +23,10 @@ pub mod validate;
 
 pub use client::{Client, ClientError};
 pub use decide::{
-    Answer, ChoiceAnswer, ChoiceCriteria, ChoiceQuestion, DecideAnswer, DecideRequest,
-    DecideResponse, DoneReason, Extra, LayaExtra, NoulAnswer, NoulCriteria, NoulQuestion, Question,
-    Questions, Routing, ScoreAnswer, ScoreQuestion, SystemOneRequest, SystemOneResponse, Usage,
+    Answer, ChoiceAnswer, ChoiceCriteria, ChoiceQuestion, DecideAnswer, DecideOptions,
+    DecideRequest, DecideResponse, DoneReason, Extra, LayaExtra, NoulAnswer, NoulCriteria,
+    NoulQuestion, Question, Questions, Routing, ScoreAnswer, ScoreQuestion, SystemOneRequest,
+    SystemOneResponse, Usage,
 };
 pub use error::{ErrorBody, ErrorCode, Loc, ValidationIssue};
 pub use keep_alive::{KeepAlive, KeepAliveError};
@@ -40,8 +41,9 @@ pub const DEFAULT_PORT: u16 = 11435;
 /// `OLLAYA_HOST` when unset.
 pub const DEFAULT_HOST: &str = "127.0.0.1:11435";
 
-/// Largest request body, in bytes (`413 REQUEST_TOO_LARGE` above it).
-pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// Largest request body, in bytes (`413 REQUEST_TOO_LARGE` above it). Room for a few photos as
+/// base64 `data:` URLs for image-input models.
+pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Questions per request.
 pub const MIN_QUESTIONS: usize = 1;
 pub const MAX_QUESTIONS: usize = 256;
