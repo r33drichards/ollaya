@@ -299,6 +299,7 @@ mod tests {
             "--image",
             "a.jpg",
             "--image=c.webp",
+            "--no-resize",
             "compare",
             "them",
         ])
@@ -315,6 +316,7 @@ mod tests {
             ]
         );
         assert_eq!(r.state.join(" "), "compare them");
+        assert!(r.no_resize);
     }
 
     #[test]

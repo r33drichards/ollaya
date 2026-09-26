@@ -15,14 +15,14 @@ It is the first image-input family. It needs three things no other family has:
 
 Everything after the logits is Laya's: calibration, answers, the wire format.
 
-**Status: conversion done, runtime not started.**
+**Status: runtime implemented and at parity on CPU; library entry not published yet.**
 
 | Step | Status |
 |---|---|
-| 1. Export, ORT parity against the PyTorch reference, goldens (`convert/ollaya_convert/families/laya_vision/`) | **done**, measured below |
-| 2. Rust layout (`ollaya_decision::laya_vision`) against the goldens' ids | to do |
-| 3. Rust image preprocessing against the goldens' pixel hashes | to do |
-| 4. Engine, API, CLI and MCP wiring (`ollaya_runner::laya_vision`, `--image`, body limits) | to do |
+| 1. Export, ORT parity against the PyTorch reference, goldens (`convert/ollaya_convert/families/laya_vision/`) | **done**, [measured](#measured-parity) |
+| 2. Rust layout (`ollaya_decision::laya_vision`) against the goldens' ids | **done**: 40/40 rows identical |
+| 3. Rust image preprocessing (`ollaya_runner::image`) against the goldens' pixel hashes | **done**: 26/26 images bit-exact |
+| 4. Engine, API, CLI and MCP wiring | **done**, [below](#runtime) |
 | 5. Library entry, registry manifest, site page | to do |
 
 | | |
@@ -58,7 +58,7 @@ Everything after the logits is Laya's: calibration, answers, the wire format.
 
 ## Request → rows
 
-### Images in the request (proposed, step 4)
+### Images in the request
 
 Images travel inside `state`, which is already an untyped JSON value on every endpoint
 (`crates/ollaya-api/src/decide.rs`). No schema changes, and `/v1/systemone` stays wire-identical to
@@ -82,6 +82,10 @@ TypeSafe. The convention is upstream's own (`laya.vlm.split_state`):
   no image run.
 - On a model without the vision layout, a state with `image`/`images` keys is just JSON text, as
   today. The `laya` router must not send an image state to a text model.
+- A bad image is a 400 whose validation issue points at it (`docs/api.md` §4.4): `string_type` /
+  `list_type` (wrong JSON type), `image_data` (not base64), `image_type` (not PNG, JPEG, WebP or
+  GIF), `image_decode`, `image_too_large` (over 50 megapixels, checked before decoding),
+  `too_many_images` (over 16), `image_size` (resize off, not 512×512).
 
 ### Row text and ids (`laya.vlm.build_vlm_inputs`)
 
@@ -117,6 +121,13 @@ tail    "\n{type} question: {instructions}<end_of_utterance>\nAssistant: Options
   a cut state through the existing `state_truncated` field (`/api/decide`), as it does for Laya. Cut
   options and instructions are not reported, also as for Laya. The goldens keep upstream's report
   (`truncation`) in case that changes.
+
+Ollaya deviations, on inputs that never occur with string criteria:
+
+1. A non-string criterion value renders as JSON (Laya's rule, which the shared question parser
+   applies to every Laya layout); upstream laya-vision uses Python `str()`.
+2. noul criteria keys match case-insensitively, as the shared parser does; upstream reads only
+   `"true"` / `"false"`.
 
 `layout.py` in the family folder states these rules without calling upstream. It is the spec for
 `ollaya_decision::laya_vision`. Run with the Rust tokenizer core, it reproduces every upstream row
@@ -155,18 +166,42 @@ to BICUBIC. The goldens use the CPU path, which is what the checkpoint's publish
 Measured on the case set, PIL's `Idefics3ImageProcessorPil` differs from the torchvision output by up
 to 2 grey levels on 0.1–3.5% of pixels.
 
-So the Rust port reproduces torchvision's kernel:
+**The exact kernel.** On the CPU, torchvision hands a uint8 image straight to ATen
+(`interpolate(mode="lanczos", antialias=True)`), whose uint8 path is Pillow-SIMD's fixed-point
+convolution. Pinned down empirically, bit-exact against torch on random images at 14 sizes
+(including the real 2048 and 512 hops), then on every golden image:
 
-- ATen's antialiased separable resample: Lanczos-3, support `3 · max(1, scale)`, centres at
-  `(i + 0.5) · scale`, weights clipped at the borders and renormalised;
-- the uint8 rounding after each hop.
+- separable, **horizontal pass first**, the intermediate rounded to uint8; an axis whose size does
+  not change is not resampled;
+- per output pixel `i`: centre `(i + 0.5) · scale`, support `3 · max(scale, 1)`, bounds
+  `int(centre ± support + 0.5)` clipped to the image, weights `lanczos3((x − centre + 0.5) / max(scale, 1))`
+  normalised to sum 1 (in f64);
+- weights quantized to integers at the largest precision `p ≤ 22` for which
+  `int(0.5 + max_weight · 2^(p+1)) < 2^15` (they fit int16), rounding half away from zero;
+- `acc = 2^(p−1) + Σ pixel · weight`, output `clamp(acc >> p, 0, 255)`.
 
-laya-vision's `laya/preprocess.py` (`_axis_weights`) already re-derives these weights and checks them
-against torchvision to float64 agreement. The goldens pin each image's final uint8 pixels by sha256,
-so the Rust preprocessing is tested bit for bit, separately from the network. `--pixels-dir` dumps
-them as `.npy` for debugging. JPEG decoding is a second risk: Rust decoders are not guaranteed to
-match libjpeg-turbo to the bit, and one golden case is a JPEG. If that case is off by a grey level,
-the fix is a bit-exact decoder, never a tolerance.
+A float-weight implementation (laya-vision's `_axis_weights`, or any "Lanczos" from an image
+library) is off by up to 2 levels on 0.2–1.7% of pixels (measured on the same random images). `ollaya_runner::image` implements the fixed-point
+kernel; the goldens pin each image's final pixels by sha256, so the preprocessing is tested bit for
+bit, separately from the network (`--pixels-dir` dumps them as `.npy` for debugging).
+
+**JPEG is decoded by libjpeg.** Upstream decodes with PIL, which uses libjpeg-turbo (3.1.4 in
+Pillow 12). The pure-Rust decoders do not match it: zune-jpeg (the `image` crate's) and
+jpeg-decoder differ by up to 3 levels on 0.4–8% of pixels, even on greyscale files, so the IDCT
+differs, not only chroma upsampling. The `mozjpeg` crate (libjpeg-turbo's decoder, built from C
+with the system compiler) matches libjpeg-turbo bit for bit on 4:4:4, 4:2:2, 4:2:0 and greyscale
+files and on both golden JPEGs. The runner uses it for JPEG only, with its SIMD (nasm) build turned
+off so every platform runs the same C code; PNG, WebP and GIF stay on the pure-Rust `image`
+decoders. This is the runner's first C dependency besides ONNX Runtime. libjpeg's fatal errors
+unwind to a `catch_unwind` and become `image_decode` issues.
+
+Decoding deviations, untested by the goldens:
+
+- A **truncated JPEG** decodes with its missing part grey (libjpeg's behaviour); PIL refuses it.
+- A **CMYK JPEG** is refused (`image_decode`); PIL converts it.
+- **16-bit PNG** is scaled to 8 bits by the `image` crate (rounded); PIL keeps the high byte.
+- **WebP** uses the pure-Rust decoder; PIL uses libwebp. Lossless WebP should match; lossy WebP
+  has not been compared.
 
 ### Resize is optional
 
@@ -191,7 +226,7 @@ How to set it:
 
 | Where | How |
 |---|---|
-| `/api/decide` | `"options": {"resize": false}`. This is the first key of the optional `options` object that §7.3 of `docs/api.md` reserves. Other keys are `enum` issues; `resize` on a model without images is ignored. |
+| `/api/decide` | `"options": {"resize": false}`. `options` is a closed set (`docs/api.md` §7.3): a non-boolean `resize` is a `bool_type` issue, another key an `extra_forbidden` issue. Models without images ignore `resize`. |
 | Modelfile | `PARAMETER resize false`, next to `PARAMETER precision`, for a derived model such as `FROM laya-vision` / `PARAMETER resize false`. This is how `/v1/*` callers get it, because `/v1/*` stays TypeSafe-identical and takes no native options. A request's `options.resize` wins over the model's parameter. |
 | CLI | `ollaya run laya-vision --image frame.png --no-resize …` |
 | MCP | `decide` takes `resize` (boolean) next to `images`. |
@@ -260,15 +295,15 @@ Laya's, unchanged. `service.rs` needs no new code for this family.
 
 - **Context:** 1024 tokens. Each image costs 67 tokens (64 image tokens plus 3 framing tokens), so
   at most 15 images fit next to a short question. `max_images` is 16 in the graph.
-- **Request body:** a 5 MP JPEG is about 2 MB as base64, and axum's `Json` extractor rejects bodies
-  over 2 MB by default. The daemon and the runner's `/decide` need `DefaultBodyLimit`. Proposed: an
-  `OLLAYA_MAX_BODY` setting defaulting to 32 MB, listed with the other settings in `docs/api.md`
-  §15.
-- **Decoding guards:** reject an image over 50 megapixels before decoding (a decompression bomb),
-  or a file that does not decode. Both return a 400 naming the state key.
+- **Request body:** the daemon's limit is now 32 MiB (`ollaya_api::MAX_BODY_BYTES`, was 8 MiB),
+  room for a few photos as base64. The runner's `/decide` used axum's `Json` default of 2 MB,
+  which would have refused most photos between the daemon and the runner; it now allows 256 MiB
+  (only the daemon calls it, after its own limit).
+- **Decoding guards:** an image over 50 megapixels is refused from its header, before decoding (a
+  decompression bomb); a file that does not decode is refused. Both are 400s naming the image.
 - **Memory:** stage 1 allocates a 2048-pixel uint8 intermediate per image (at most 12 MB).
 - **Usage:** `input_tokens` counts the image tokens (67 per image per row), as upstream's
-  `usage.input_tokens` does. `/api/decide` adds `images`.
+  `usage.input_tokens` does. A separate image count in `usage` is not added.
 - **Logging:** `state` is user data and is not logged (PROJECT_NOTES). That covers images.
 
 ## Measured parity
@@ -322,66 +357,63 @@ cores. Each line holds:
 The two rejection lines hold the request and the expected `INVALID_REQUEST` body with its
 `image_size` issue.
 
-## Runtime plan
+## Rust runtime parity
 
-### 2. Layout: `crates/ollaya-decision/src/laya_vision.rs`
+`cargo run --release -p ollaya-runner --example parity_laya_vision -- convert/out/laya-vision-wl convert/out/goldens-laya-vision.jsonl cpu --latency`
 
-- `split_state(&Value) -> (Vec<ImageRef>, String)`, using the existing `pyjson` for the text part.
-  It returns image **references** (state key, index); the bytes stay in the request.
-- `LayaVisionLayout::encode(state, question) -> Encoded { ids, markers, option_span, state_truncated }`,
-  with the rules above and the image-run string from `decision.json`.
-- Tests: an ids golden test over `goldens-laya-vision.jsonl`, like the other families.
+The runtime runs every golden request as it serves one (decode, resize, tokenize, one padded batch
+through the fp32 graph on the CPU EP), and checks each layer separately:
 
-### 3. Preprocessing: `crates/ollaya-runner/src/image.rs`
+| Check | Result |
+|---|---|
+| state text (images removed) | 26/26 identical |
+| image pixels, sha256 of the prepared 512×512×3 uint8 array | **26/26 bit-exact** (PNG RGB, RGBA, greyscale, palette, JPEG; upscaled, one hop, two hops; resize off) |
+| rows: ids, markers, option span | 40/40 identical |
+| argmax, runtime vs goldens | 40/40 |
+| option logits, max abs | 1.2e-4 (tolerance 1e-3, as von's) |
+| act logits, max abs | 2.7e-5 |
+| calibrated probabilities, max abs | 1.0e-5 |
+| requests refused with the golden's `image_size` issue | 2/2 |
 
-- Decode with the `image` crate (PNG, JPEG, WebP, GIF), with no EXIF rotation. Convert to RGB8 as
-  PIL does.
-- A port of ATen's antialiased Lanczos (separable, float weights, uint8 round and clamp per hop),
-  run twice as above, then normalize (`(v − 127.5) / 127.5`, f32) into the `pixel_values` buffer.
-- `resize = false`: check that each decoded image is 512×512, returning the `image_size` issue
-  otherwise, and normalize it directly. No resampler runs.
-- Tests: the sha256 of every golden image's pixels, bit-exact, on both paths. This is a new `image` crate
-  dependency in the runner only; it's pure Rust, and the daemon does not decode images.
+Before JPEG went through libjpeg, the two JPEG cases failed the pixel check and moved logits by up
+to 0.23 (answers unchanged): the decoder, not the model, was the largest source of error.
 
-### 4. Wiring
+**Speed** (this sandbox: 4 CPU cores, fp32, one request at a time; not a benchmark): 0.6–0.9 s per
+request with one image and 1–4 questions, 1.3–1.5 s with two images. Encoding (decode, resize,
+tokenize) is 50–130 ms per request with one image and resize on (the 2048-pixel intermediate), and
+about 3 ms with resize off. GPU and fp16
+are not measured.
 
-- **Runner engine** (`crates/ollaya-runner/src/laya_vision.rs`):
-  - add `laya-vision-terminator-v1` to `LAYOUTS` with a match arm in `engine::load`;
-  - `Engine::run(state, questions)` keeps its signature, since the images are inside `state`;
-  - decode and preprocess once per request, then one `session.run` per batch, with the same
-    `pixel_values` fed to every batch;
-  - batches are split by token budget as today, so image rows count their 67 tokens per image.
-- **IPC:** `POST /decide` on the runner stays JSON, with the images inside it as base64. The size is
-  bounded by the body limit. A binary side channel is not worth it at these sizes.
-- **Server:**
-  - `DefaultBodyLimit` on the daemon's and the runner's routers;
-  - image count and pixel guards return 400s with the existing `{error}` body;
-  - `DecideRequest` gains an optional `options: {resize?: bool}` (unknown keys are `enum` issues).
-    The server resolves the value (request, else the model's `resize` parameter, else true) and
-    passes it to the runner's `/decide` next to `state`.
-  - `Modelfile` and `/api/create` accept `PARAMETER resize true|false`. It is stored in the model's
-    `params` layer, like `precision`.
-  - `usage.images` goes on `/api/decide` only.
-- **CLI:** `ollaya run <model> --image PATH` is **implemented** (`crates/ollaya/src/run.rs`). The
-  flag repeats, and the images always go in a `"images"` list, in argument order:
-  - text becomes `{"images": [...], "text": ...}`;
-  - an object state gains `images` ahead of its own keys;
-  - no state at all means the images alone;
-  - an array, or an object that already has `image`/`images`, is refused.
-  Files are recognised by their magic bytes (PNG, JPEG, WebP, GIF) and read before the daemon is
-  contacted. `--no-resize` (to do, with `options`) will set `options.resize = false`. `ollaya show` lists "vision" under
-  capabilities.
-- **MCP:** the `decide` tool gains an `images` argument (paths or data URLs), which the tool turns
-  into data URLs before calling the daemon, and a `resize` boolean.
-- **Registry and manifest:** no new media types. The `decision` layer carries the image settings;
-  `ModelConfig.family` is `laya-vision`.
-- **Precision:** fp32 on CPU and fp16 on GPU, as for Laya, once fp16 parity is measured. Until then,
-  ship fp32 only.
+A smoke test through the real runner process (`ollaya runner --graph-fp32 … --device cpu`, HTTP)
+answered a 512×512 JPEG of a green triangle "green" and "triangle" with resize on and off, took two
+images in one request, and refused a non-image payload with an `image_type` issue at
+`state.images.0`.
 
-### 5. Library entry
+## Runtime
+
+| Piece | Where |
+|---|---|
+| Layout: `split_state`, `prefix_ids`, `encode` → ids, markers, option span; image issues | `crates/ollaya-decision/src/laya_vision.rs` |
+| Decode (libjpeg for JPEG, `image` for PNG/WebP/GIF), exact Lanczos, `resize` off, normalize | `crates/ollaya-runner/src/image.rs` |
+| Engine: contract V, one `session.run` per token-budget batch, pixels fed to every batch | `crates/ollaya-runner/src/laya_vision.rs` |
+| `RunOptions { resize }`, `Engine::run_with`; runner `/decide` takes `options`, returns image issues as `detail` | `crates/ollaya-runner/src/{lib,engine,server}.rs` |
+| `DecideOptions`, `options` validation (`bool_type`, `extra_forbidden`), `parameters.resize`, 32 MiB body | `crates/ollaya-api` |
+| Options to the runner (request, else the model's `resize` parameter); runner issues passed through as the 400's `detail`; `resize` merged into the `params` layer; `show` lists it | `crates/ollaya-server` |
+| CLI `--image` (repeatable, in order) and `--no-resize`; `PARAMETER resize` in Modelfiles | `crates/ollaya/src/{run,modelfile,commands}.rs` |
+| MCP `decide`: `images` (paths or data URLs) and `resize` | `crates/ollaya/src/mcp.rs` |
+| Parity against the goldens | `crates/ollaya-runner/examples/parity_laya_vision.rs` |
+
+`crates/ollaya-server/tests/http.rs` (`options_and_image_issues`) covers the daemon end to end with
+a fake runner: `options.resize` reaches the runner from `/api/decide` but not from `/v1/*`, a
+model's `PARAMETER resize` is the default and the request overrides it, and the runner's image
+issue comes back as the request's own 400 body.
+
+Not done: fp16 (unmeasured, so ship fp32 only); `ollaya show` capabilities; the `laya` router does not yet keep an image state away from its text models (it would read the data URL as text); and the step below.
+
+## Remaining: library entry
 
 `laya-vision` (`:latest` = `:201m`), with the manifest pointing at `thaitea/laya-vision` @
-`8b318c99…`. Add a site page and a README table row.
+`8b318c99…` (`package.py`, as for the other families). Add a site page and a README table row.
 
 ## Later
 
@@ -410,6 +442,9 @@ uv run python -m ollaya_convert.weightless out/laya-vision \
     --prefix model. --small-transposes --out out/laya-vision-wl
 uv run $W python -m ollaya_convert.families.laya_vision.parity out/laya-vision-wl
 uv run $W python -m ollaya_convert.families.laya_vision.goldens --out out/goldens-laya-vision.jsonl
+cd ..
+cargo run --release -p ollaya-runner --example parity_laya_vision -- \
+    convert/out/laya-vision-wl convert/out/goldens-laya-vision.jsonl cpu --latency
 ```
 
 - `pillow` and `torchvision` are added per run, as `von-sdk` is for von. The convert lockfile cannot

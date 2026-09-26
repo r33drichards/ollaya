@@ -194,6 +194,27 @@ pub struct DecideRequest {
     pub keep_alive: Option<KeepAlive>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extras: Vec<Extra>,
+    /// Native per-request options (`/api/decide` only).
+    #[serde(default, skip_serializing_if = "DecideOptions::is_empty")]
+    pub options: DecideOptions,
+}
+
+/// `/api/decide` `options`. Every field is optional; a model ignores the ones it has no use for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecideOptions {
+    /// Image-input models: `false` uses images that are already the model's input size as they
+    /// are, instead of resizing them (the default). Other models ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resize: Option<bool>,
+}
+
+impl DecideOptions {
+    /// The option names, for validation messages.
+    pub const NAMES: [&'static str; 1] = ["resize"];
+
+    pub fn is_empty(&self) -> bool {
+        self.resize.is_none()
+    }
 }
 
 impl DecideRequest {
@@ -204,6 +225,7 @@ impl DecideRequest {
             questions,
             keep_alive: None,
             extras: Vec::new(),
+            options: DecideOptions::default(),
         }
     }
 
@@ -215,6 +237,7 @@ impl DecideRequest {
             questions: None,
             keep_alive,
             extras: Vec::new(),
+            options: DecideOptions::default(),
         }
     }
 

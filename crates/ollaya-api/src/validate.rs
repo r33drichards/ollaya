@@ -16,8 +16,8 @@
 use serde_json::{Map, Value};
 
 use crate::decide::{
-    ChoiceCriteria, ChoiceQuestion, DecideRequest, Extra, NoulCriteria, NoulQuestion, Question,
-    Questions, ScoreQuestion, SystemOneRequest,
+    ChoiceCriteria, ChoiceQuestion, DecideOptions, DecideRequest, Extra, NoulCriteria,
+    NoulQuestion, Question, Questions, ScoreQuestion, SystemOneRequest,
 };
 use crate::error::{ErrorBody, Loc, ValidationIssue, body_loc};
 use crate::keep_alive::KeepAlive;
@@ -87,6 +87,7 @@ pub fn decide_request(mut obj: Body) -> Result<DecideRequest, Issues> {
         },
     };
     let extras = extras(get(&obj, "extras"), &mut issues);
+    let options = decide_options(get(&obj, "options"), &mut issues);
     match get(&obj, "stream") {
         None | Some(Value::Bool(false)) => {}
         Some(Value::Bool(true)) => {
@@ -106,6 +107,7 @@ pub fn decide_request(mut obj: Body) -> Result<DecideRequest, Issues> {
         questions,
         keep_alive,
         extras,
+        options,
     })
 }
 
@@ -425,6 +427,35 @@ fn noul_criteria(
     }
 }
 
+/// `options`: an object of known options, each of its own type.
+fn decide_options(value: Option<&Value>, issues: &mut Issues) -> DecideOptions {
+    let base = body_loc(&["options"]);
+    let mut out = DecideOptions::default();
+    match value {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(m)) => {
+            for (key, v) in m {
+                let loc = at(&base, [Loc::key(key.as_str())]);
+                match (key.as_str(), v) {
+                    ("resize", Value::Bool(b)) => out.resize = Some(*b),
+                    ("resize", _) => issues.push(ValidationIssue::wrong_type(loc, "bool_type")),
+                    // pydantic's wording for a key the model does not declare.
+                    _ => issues.push(
+                        ValidationIssue::new(
+                            loc,
+                            "extra_forbidden",
+                            "Extra inputs are not permitted",
+                        )
+                        .with_ctx(serde_json::json!({"allowed": DecideOptions::NAMES})),
+                    ),
+                }
+            }
+        }
+        Some(_) => issues.push(ValidationIssue::wrong_type(base, "dict_type")),
+    }
+    out
+}
+
 fn extras(value: Option<&Value>, issues: &mut Issues) -> Vec<Extra> {
     let base = body_loc(&["extras"]);
     let Some(value) = value else {
@@ -541,9 +572,16 @@ fn parameters(value: &Value, issues: &mut Issues) -> Option<CreateParameters> {
                 ploc,
                 "precision must be \"fp16\" or \"fp32\"",
             )),
+            ("resize", _) => match v {
+                Value::Bool(b) => params.resize = Some(*b),
+                _ => issues.push(ValidationIssue::parameter(
+                    ploc,
+                    "resize must be true or false",
+                )),
+            },
             _ => issues.push(ValidationIssue::parameter(
                 ploc,
-                format!("unknown parameter {key:?}; known parameters: precision"),
+                format!("unknown parameter {key:?}; known parameters: precision, resize"),
             )),
         }
     }

@@ -56,6 +56,7 @@ ollaya run laya --preset triage "I was charged twice for my subscription this mo
 | `--verbose` | Also print every option's probability, the routing decision and the timings |
 | `--state-json` | Parse the state as JSON. A state that looks like a JSON object or array is detected anyway |
 | `--image FILE` | Add an image, for image-input models. Repeat it for several images; they are sent in the order given |
+| `--no-resize` | Send images as they are instead of resizing them; each must already be the model's input size (512×512) |
 
 Where the questions come from, first match wins: `--questions`, then `--preset`, then questions built into the model with a Modelfile. A model with none needs one of the flags.
 

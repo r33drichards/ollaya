@@ -43,6 +43,8 @@ pub struct DecideInput {
     /// Required unless the model has a baked-in question schema.
     pub questions: Option<Value>,
     pub keep_alive: Option<KeepAlive>,
+    /// Native options (`/api/decide`); unset ones fall back to the model's parameters.
+    pub options: ollaya_api::DecideOptions,
     /// Set when the caller has gone away: once the model is loaded, the decision is skipped.
     pub cancel: Option<Arc<AtomicBool>>,
 }
@@ -86,6 +88,8 @@ pub struct CreateSpec {
     pub calibration: Option<Value>,
     /// Pin the graph precision: `fp16` or `fp32`.
     pub precision: Option<String>,
+    /// Image-input models: the default for `options.resize`.
+    pub resize: Option<bool>,
     pub license: Option<String>,
     pub description: Option<String>,
 }
@@ -170,7 +174,11 @@ impl Ollaya {
             return Err(Error::Cancelled);
         }
         let eval_started = Instant::now();
-        let raw = lease.decide(&input.state, &questions_json).await?;
+        let mut options = input.options.clone();
+        options.resize = options.resize.or(model.resize);
+        let raw = lease
+            .decide(&input.state, &questions_json, &options)
+            .await?;
         drop(lease);
         let state_tokens = raw["state_tokens"].as_u64().unwrap_or(0) as usize;
         if state_tokens > ollaya_api::MAX_STATE_TOKENS {
@@ -342,6 +350,11 @@ impl Ollaya {
                 annotations: Default::default(),
             })
         };
+        // Parameters merge into what FROM already sets (e.g. a precision-pinned tag).
+        let inherited_params = match manifest.layer(media::PARAMS) {
+            Some(d) => self.store.read_blob_json::<Value>(d)?,
+            None => Value::Object(Default::default()),
+        };
         let mut replace = |media_type: &str, bytes: Vec<u8>| -> Result<(), Error> {
             let d = blob(media_type, bytes)?;
             manifest.layers.retain(|l| l.media_type != media_type);
@@ -370,15 +383,27 @@ impl Ollaya {
                 serde_json::to_vec_pretty(c).expect("JSON value serializes"),
             )?;
         }
-        if let Some(p) = &spec.precision {
-            if is_router || !matches!(p.as_str(), "fp16" | "fp32") {
-                return Err(Error::InvalidRequest(format!(
-                    "PARAMETER precision {p:?}: use fp16 or fp32 on a model"
-                )));
+        if spec.precision.is_some() || spec.resize.is_some() {
+            if is_router {
+                return Err(Error::InvalidRequest(
+                    "PARAMETER applies to a model, not a router".into(),
+                ));
+            }
+            let mut params = inherited_params;
+            if let Some(p) = &spec.precision {
+                if !matches!(p.as_str(), "fp16" | "fp32") {
+                    return Err(Error::InvalidRequest(format!(
+                        "PARAMETER precision {p:?}: use fp16 or fp32"
+                    )));
+                }
+                params["precision"] = Value::String(p.clone());
+            }
+            if let Some(r) = spec.resize {
+                params["resize"] = Value::Bool(r);
             }
             replace(
                 media::PARAMS,
-                serde_json::to_vec(&serde_json::json!({"precision": p})).expect("serializes"),
+                serde_json::to_vec(&params).expect("serializes"),
             )?;
         }
         if let Some(l) = &spec.license {

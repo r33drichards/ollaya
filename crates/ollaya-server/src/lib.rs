@@ -20,6 +20,10 @@ pub enum Error {
     NoQuestions(String),
     #[error("{0}")]
     InvalidRequest(String),
+    /// The runner refused part of the request (e.g. an image), with the validation issues the API
+    /// returns as they are.
+    #[error("{}", ollaya_api::error::issues_message(.0))]
+    InvalidInput(Vec<ollaya_api::ValidationIssue>),
     /// A question's options do not fit the answering model's option budget.
     #[error("question {question:?}: {options} options do not fit the option budget of {model}")]
     TooManyOptions {

@@ -6,6 +6,7 @@
 //! QUESTIONS ./triage.json
 //! CALIBRATION ./calibration.json
 //! PARAMETER precision fp32
+//! PARAMETER resize false        # image-input models: use 512×512 images as they are
 //! LICENSE ./LICENSE
 //! DESCRIPTION Support ticket triage
 //! ```
@@ -24,6 +25,7 @@ pub struct Modelfile {
     pub questions: Option<Value>,
     pub calibration: Option<Value>,
     pub precision: Option<String>,
+    pub resize: Option<bool>,
     pub license: Option<String>,
     pub description: Option<String>,
 }
@@ -134,7 +136,16 @@ fn apply(mf: &mut Modelfile, directive: &str, src: Source, base: &Path, line: us
             let (key, val) = v.split_once(char::is_whitespace).unwrap_or((&v, ""));
             match key {
                 "precision" => mf.precision = Some(val.trim().to_owned()),
-                other => bail!("line {line}: unknown PARAMETER {other:?}; supported: precision"),
+                "resize" => {
+                    mf.resize = Some(match val.trim() {
+                        "true" => true,
+                        "false" => false,
+                        v => bail!("line {line}: PARAMETER resize takes true or false, not {v:?}"),
+                    })
+                }
+                other => {
+                    bail!("line {line}: unknown PARAMETER {other:?}; supported: precision, resize")
+                }
             }
         }
         other => bail!("line {line}: unknown directive {other:?}"),
@@ -190,6 +201,9 @@ LICENSE """MIT"""
         assert!(parse("QUESTIONS {}", base).is_err()); // no FROM
         assert!(parse("FROM laya\nTEMPLATE x", base).is_err());
         assert!(parse("FROM laya\nPARAMETER top_k 3", base).is_err());
+        assert!(parse("FROM laya-vision\nPARAMETER resize no", base).is_err());
+        let mf = parse("FROM laya-vision\nPARAMETER resize false", base).unwrap();
+        assert_eq!(mf.resize, Some(false));
         assert!(parse("FROM laya\nQUESTIONS \"\"\"\n{", base).is_err());
         assert!(parse("FROM laya\nQUESTIONS {not json", base).is_err());
     }

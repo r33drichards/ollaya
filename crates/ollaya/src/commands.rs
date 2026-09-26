@@ -293,9 +293,10 @@ pub fn create_request(name: &str, mf: modelfile::Modelfile) -> Result<CreateRequ
         from: mf.from,
         questions,
         calibration,
-        parameters: mf
-            .precision
-            .map(|p| CreateParameters { precision: Some(p) }),
+        parameters: (mf.precision.is_some() || mf.resize.is_some()).then_some(CreateParameters {
+            precision: mf.precision,
+            resize: mf.resize,
+        }),
         license: mf.license.map(License::One),
         description: mf.description,
         stream: None,

@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use futures_util::StreamExt;
-use ollaya_api::{Client, PullRequest, SystemOneRequest};
+use ollaya_api::{Client, DecideRequest, PullRequest, SystemOneRequest};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -72,6 +72,15 @@ pub struct DecideParams {
     /// "moderation", "router" or "agent". Read ollaya://presets/<name> to see what each one asks.
     #[serde(default)]
     pub preset: Option<String>,
+    /// Image-input models (laya-vision): images to decide about, in order. Each is a path to a
+    /// PNG, JPEG, WebP or GIF file on this machine, or a data: URL. They are added to the state
+    /// as its "images" list (a text state goes under "text").
+    #[serde(default)]
+    pub images: Option<Vec<String>>,
+    /// Image-input models: false sends images as they are instead of resizing them; each must
+    /// then already be 512×512. Leave it out to resize (the default).
+    #[serde(default)]
+    pub resize: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -126,13 +135,41 @@ noul, the probability that the statement is true. The response is exactly TypeSa
                 )));
             }
         };
-        let request = SystemOneRequest {
-            model: p.model.unwrap_or_else(|| "laya".to_owned()),
-            state: p.state,
-            questions,
+        let mut urls = Vec::new();
+        for image in p.images.unwrap_or_default() {
+            if image.starts_with("data:") {
+                urls.push(image);
+                continue;
+            }
+            match crate::run::image_data_url(std::path::Path::new(&image)) {
+                Ok(url) => urls.push(url),
+                Err(e) => return Ok(tool_error(&format!("{e:#}"))),
+            }
+        }
+        let state = match crate::run::attach_images(p.state, &urls) {
+            Ok(s) => s,
+            Err(e) => return Ok(tool_error(&format!("{e:#}"))),
         };
+        let model = p.model.unwrap_or_else(|| "laya".to_owned());
         let client = connect().await?;
-        match client.systemone(&request).await {
+        // `resize` is a native option, so it goes through /api/decide; the answer is returned in
+        // the same /v1/systemone shape either way.
+        let result = match p.resize {
+            None => {
+                let request = SystemOneRequest {
+                    model,
+                    state,
+                    questions,
+                };
+                client.systemone(&request).await
+            }
+            Some(resize) => {
+                let mut request = DecideRequest::new(model, state, questions);
+                request.options.resize = Some(resize);
+                client.decide(&request).await.map(|r| r.into_system_one())
+            }
+        };
+        match result {
             Ok(response) => Ok(structured(&response)),
             Err(e) => Ok(tool_error(&e.to_string())),
         }

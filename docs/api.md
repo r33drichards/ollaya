@@ -66,8 +66,8 @@ Any other path returns `404 NOT_FOUND`. A known path with the wrong method retur
   JSON **whatever its `Content-Type`** (Ollama behaviour: `curl -d` sends
   `application/x-www-form-urlencoded`). Responses carry `Content-Type: application/json`, except
   streams (`application/x-ndjson`) and `GET /` (`text/plain; charset=utf-8`).
-- **Size.** A request body is at most **8 MiB** (8,388,608 bytes); larger bodies get
-  `413 REQUEST_TOO_LARGE`.
+- **Size.** A request body is at most **32 MiB** (33,554,432 bytes), room for a few photos as
+  base64 `data:` URLs for image-input models; larger bodies get `413 REQUEST_TOO_LARGE`.
 - **Field names** are `snake_case` on every endpoint, as TypeSafe and Ollama spell them.
 - **Unknown request fields are ignored** on every endpoint. This matches TypeSafe (pydantic
   `extra="ignore"`) and Ollama (Go JSON decoding), and lets newer clients talk to older servers.
@@ -186,7 +186,7 @@ The `code` set is **open**: clients MUST handle an unknown code by falling back 
 | `NOT_FOUND` | 404 | No such endpoint | no |
 | `METHOD_NOT_ALLOWED` | 405 | Endpoint exists, method does not | no |
 | `OPERATION_IN_PROGRESS` | 409 | A pull or create is writing the same model name ([§11](#11-idempotency-and-retries)) | yes, after it finishes |
-| `REQUEST_TOO_LARGE` | 413 | Body over 8 MiB | no |
+| `REQUEST_TOO_LARGE` | 413 | Body over 32 MiB | no |
 | `QUEUE_FULL` | 503 | `OLLAYA_MAX_QUEUE` requests are already waiting; sent with `Retry-After: 1` | yes |
 | `MODEL_LOAD_FAILED` | 500 | The runner could not load the model: corrupt files, not enough memory, or no load within `OLLAYA_LOAD_TIMEOUT` | rarely |
 | `INFERENCE_FAILED` | 500 | The runner crashed or failed during a decision | yes |
@@ -256,6 +256,13 @@ TypeSafe SDK users therefore see the same text from Ollaya as from TypeSafe.
 | `keep_alive` | `keep_alive` does not parse ([§6](#6-keep_alive)) | – |
 | `enum` | Unknown value in a closed set, e.g. `extras` | `{"expected": "'laya'"}` |
 | `stream_unsupported` | `"stream": true` on `/api/decide` | – |
+| `extra_forbidden` | Unknown key in `options` (`/api/decide`) | `{"allowed": ["resize"]}` |
+| `image_data` | Image-input models: an image is not a base64 `data:` URL or base64 | – |
+| `image_type` | Image-input models: an image is not PNG, JPEG, WebP or GIF | – |
+| `image_decode` | Image-input models: an image does not decode (corrupt, CMYK JPEG) | – |
+| `image_too_large` | Image-input models: an image over 50 megapixels | `{"max_pixels": 50000000, "actual_width": w, "actual_height": h}` |
+| `image_size` | Image-input models, `resize` off: an image is not the model's input size | `{"width": 512, "height": 512, "actual_width": w, "actual_height": h}` |
+| `too_many_images` | Image-input models: more images than the model takes | `{"max_images": 16, "images": n}` |
 | `parameter` | Unknown or invalid `/api/create` parameter | – |
 | `calibration` | `/api/create` calibration key that is not `<type>:<bucket>` | – |
 | `too_many_options` | Code `TOO_MANY_OPTIONS` | `{"options": n, "model": "<canonical>"}` |
@@ -303,7 +310,7 @@ together.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `model` | string | yes | Non-empty; a valid name ([§3](#3-model-names-and-resolution)) |
-| `state` | string \| object \| array | yes on `/v1/*` (see [§7.3](#73-post-apidecide) for `/api/decide`) | Any JSON string, object or array; `""` is allowed. Numbers, booleans and `null` are `state_type` issues. At most **65,536 tokens** by the answering model's tokenizer (`INPUT_TOO_LONG`). |
+| `state` | string \| object \| array | yes on `/v1/*` (see [§7.3](#73-post-apidecide) for `/api/decide`) | Any JSON string, object or array; `""` is allowed. Numbers, booleans and `null` are `state_type` issues. At most **65,536 tokens** by the answering model's tokenizer (`INPUT_TOO_LONG`). For image-input models, an object's `"image"` (one) and `"images"` (a list) hold images as `data:` URLs or base64, in that order; the other keys are the state's text. The issue `loc` of a bad image is `["body","state","image"]` or `["body","state","images",n]`. Other models read those keys as ordinary JSON. |
 | `questions` | object: question id → [question](#52-question-schema) | yes, unless the model has embedded questions | **1–256** questions. Ids are any strings, in the caller's order. If present, they **replace** the model's embedded questions entirely. |
 
 ### 5.2 Question schema
@@ -471,12 +478,13 @@ The same endpoint loads and unloads models, as Ollama's `/api/generate` does: a 
 | `questions` | object | with `state`, unless the model has embedded questions | the model's embedded questions | [§5.2](#52-question-schema). Not allowed without `state` (`missing` issue on `state`). |
 | `keep_alive` | string \| number | no | `OLLAYA_KEEP_ALIVE` (`5m`) | [§6](#6-keep_alive) |
 | `extras` | array of string | no | `[]` | Closed set: `"laya"`. Each value adds a same-named object to every answer. Unknown values are `enum` issues. |
+| `options` | object | no | `{}` | Closed set. `resize` (boolean): image-input models resize images to their input size (`true`, the default unless the model's `resize` parameter says otherwise), or take images that already have it as they are (`false`; any other size is an `image_size` issue). Models without images ignore it. A wrong type is a `bool_type` issue; other keys are `extra_forbidden` issues. |
 | `stream` | boolean | no | `false` | Reserved. `/api/decide` does not stream, and `true` is a `stream_unsupported` issue. It is rejected rather than ignored so that a streaming mode can be added later without changing what existing `stream: true` callers receive. |
 
 Native options are deliberately few. `keep_alive` is Ollama's lifecycle control. `extras` is how
-model-family outputs are exposed without redefining a TypeSafe field. There is no `options` object
-(Ollama's sampling parameters do not apply to decision models); one can be added later as an
-optional field.
+model-family outputs are exposed without redefining a TypeSafe field. `options` holds per-request
+switches a model family reads; today only `resize` for image-input models. Ollama's sampling
+parameters do not apply to decision models and are not accepted there.
 
 #### Response
 
@@ -1000,7 +1008,7 @@ it names, and sends their contents as JSON.
 | `from` | string | yes | – | Local base model, possibly a router. It must exist (`404`); it is never pulled. |
 | `questions` | object | no | inherited | Validated as in [§5.2](#52-question-schema) (1–256 questions); becomes the embedded schema |
 | `calibration` | object | no | inherited | `temperature`: array of up to 3 numbers (choice, score, noul). `temperature_by_options`: object of `"<type>:<2\|3-5\|6-10\|11+>"` → number. |
-| `parameters` | object | no | inherited | Closed set: `precision` (`"fp16"` or `"fp32"`) pins one graph. Other keys are `parameter` issues. |
+| `parameters` | object | no | inherited | Closed set: `precision` (`"fp16"` or `"fp32"`) pins one graph; `resize` (boolean) is the default for `options.resize` on an image-input model, which is how `/v1/*` callers get it. Parameters merge into the ones `from` already has. Other keys are `parameter` issues. |
 | `license` | string \| array of string | no | inherited | License text(s); several are joined with a blank line |
 | `description` | string | no | inherited | One line, shown by `/v1/models` and `ollaya show` |
 | `stream` | boolean | no | `true` | As in `/api/pull` |
@@ -1505,8 +1513,9 @@ Therefore:
   This blocks DNS-rebinding attacks from web pages.
 
 **Input and data handling.**
-- **Limits.** The body limit (8 MiB), the question and option limits and the 65,536-token state
-  limit bound the work one request can cause.
+- **Limits.** The body limit (32 MiB), the question and option limits, the 65,536-token state
+  limit and, for image-input models, the image count and the 50-megapixel decode limit bound the
+  work one request can cause.
 - **Registry data is untrusted.** Every blob is verified against its sha256 before use, and
   manifests and JSON layers are validated when read.
 - **User data stays out of logs and errors.** `state` and question text are never logged, and are

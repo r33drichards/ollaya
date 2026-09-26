@@ -29,6 +29,8 @@ pub struct Loadable {
     pub config: ModelConfig,
     /// A question schema baked in with a Modelfile, used when a request brings none.
     pub questions: Option<Value>,
+    /// `PARAMETER resize`: the default for a request's `options.resize`.
+    pub resize: Option<bool>,
     /// Bytes on disk, for `ps` and scheduling.
     pub size: u64,
 }
@@ -101,6 +103,7 @@ pub fn resolve_entry(store: &Store, entry: Entry) -> Result<Resolved, Error> {
         }
     }
     // A precision-pinned tag (`laya:en-fp32`) keeps only the graph it names.
+    let mut resize = None;
     if let Some(params) = manifest.layer(media::PARAMS) {
         let params: Value = store.read_blob_json(params)?;
         match params["precision"].as_str() {
@@ -108,6 +111,7 @@ pub fn resolve_entry(store: &Store, entry: Entry) -> Result<Resolved, Error> {
             Some("fp16") => files.graph_fp32 = None,
             _ => {}
         }
+        resize = params["resize"].as_bool();
     }
     if files.graph_fp32.is_none() && files.graph_fp16.is_none() {
         return Err(Error::Corrupt(format!("{name}: manifest has no graph")));
@@ -123,6 +127,7 @@ pub fn resolve_entry(store: &Store, entry: Entry) -> Result<Resolved, Error> {
         calibration,
         config,
         questions,
+        resize,
         size: manifest.total_size(),
     })))
 }

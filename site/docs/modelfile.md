@@ -102,10 +102,19 @@ Probabilities are only useful for thresholds if they are calibrated. Ollaya cali
 
 ### PARAMETER
 
-The only parameter is `precision`. A bare model carries an fp16 and an fp32 graph and picks one when it loads (fp16 on a CUDA GPU, fp32 on the CPU). `PARAMETER precision fp32` pins the fp32 graph everywhere, for example to match an fp32 reference exactly.
+There are two parameters.
+
+`precision`: a bare model carries an fp16 and an fp32 graph and picks one when it loads (fp16 on a CUDA GPU, fp32 on the CPU). `PARAMETER precision fp32` pins the fp32 graph everywhere, for example to match an fp32 reference exactly.
 
 ```dockerfile
 PARAMETER precision fp32
+```
+
+`resize`, for image-input models: `false` makes the model take images that are already its input size (512×512) as they are instead of resizing them, for example game frames rendered at that size. Other sizes are then refused. A request's `options.resize` overrides it; this is how `/v1/*` callers, which send no native options, get it.
+
+```dockerfile
+FROM laya-vision
+PARAMETER resize false
 ```
 
 ### DESCRIPTION

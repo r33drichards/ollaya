@@ -50,6 +50,10 @@ pub struct RunArgs {
     /// are the state.
     #[arg(long = "image", value_name = "FILE")]
     pub images: Vec<PathBuf>,
+    /// Send images as they are instead of resizing them; each must already be the model's input
+    /// size (512×512 for laya-vision).
+    #[arg(long)]
+    pub no_resize: bool,
 }
 
 fn parse_keep_alive(s: &str) -> Result<KeepAlive, String> {
@@ -180,6 +184,7 @@ struct Session {
     /// `--image` files, in the order given, and their `data:` URLs.
     image_paths: Vec<PathBuf>,
     images: Vec<String>,
+    no_resize: bool,
 }
 
 impl Session {
@@ -187,6 +192,9 @@ impl Session {
         let state = attach_images(state, &self.images)?;
         let mut req = DecideRequest::new(&self.model, state, self.questions.clone());
         req.keep_alive = self.keep_alive;
+        if self.no_resize {
+            req.options.resize = Some(false);
+        }
         Ok(self.client.decide(&req).await?)
     }
 
@@ -286,6 +294,7 @@ async fn prepare(args: &RunArgs) -> Result<Session> {
         state_json: args.state_json,
         image_paths: args.images.clone(),
         images: Vec::new(),
+        no_resize: args.no_resize,
     })
 }
 
@@ -537,6 +546,7 @@ mod tests {
             verbose: false,
             state_json: false,
             images: vec![],
+            no_resize: false,
         };
         assert!(choose_questions(&args(None, None), true).unwrap().is_none());
         assert!(

@@ -91,6 +91,16 @@ mod fake_runner {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
+        // Stands in for an image-input model refusing an image it may not resize.
+        if req["options"]["resize"] == false {
+            return error(
+                StatusCode::BAD_REQUEST,
+                json!({"code": "INVALID_REQUEST", "message": "state.image: the image is 640x480; with resize off it must be 512x512",
+                       "detail": [{"loc": ["body", "state", "image"], "type": "image_size",
+                                   "msg": "the image is 640x480; with resize off it must be 512x512",
+                                   "ctx": {"width": 512, "height": 512, "actual_width": 640, "actual_height": 480}}]}),
+            );
+        }
         if state.contains("CRASH") {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1109,6 +1119,108 @@ macro_rules! tests {
     };
 }
 
+/// `options.resize` reaches the runner from `/api/decide` (not `/v1`), a model's `PARAMETER
+/// resize` is its default, and the runner's image issue comes back as the request's own.
+async fn options_and_image_issues() {
+    let d = Daemon::laya().await;
+    let q = json!({"shape": {"type": "choice", "instructions": "Which?", "criteria": ["a", "b"]}});
+    let state = json!({"image": "data:image/png;base64,AAAA", "note": "x"});
+    let body = |extra: Value| {
+        let mut b = json!({"model": "laya:en", "state": state, "questions": q});
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b.to_string()
+    };
+
+    let (status, _, v) = post_raw(&d.url("/api/decide"), body(json!({}))).await;
+    assert_eq!(status, 200, "{v}");
+    let (status, _, v) = post_raw(
+        &d.url("/api/decide"),
+        body(json!({"options": {"resize": false}})),
+    )
+    .await;
+    assert_eq!(v["code"], "INVALID_REQUEST", "{v}");
+    assert!((400..500).contains(&status));
+    assert_eq!(v["detail"][0]["type"], "image_size");
+    assert_eq!(v["detail"][0]["loc"], json!(["body", "state", "image"]));
+    assert_eq!(v["detail"][0]["ctx"]["actual_width"], 640);
+    assert_eq!(
+        v["error"],
+        "state.image: the image is 640x480; with resize off it must be 512x512"
+    );
+    // /v1 is TypeSafe's wire format: a native field is ignored, never forwarded.
+    let (status, _, v) = post_raw(
+        &d.url("/v1/systemone"),
+        body(json!({"options": {"resize": false}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+
+    // Validation: resize is a boolean, and there are no other options.
+    let (_, _, v) = post_raw(
+        &d.url("/api/decide"),
+        body(json!({"options": {"resize": "no", "crop": true}})),
+    )
+    .await;
+    let kinds: Vec<(String, String)> = v["detail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            let loc: Vec<String> = i["loc"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l.as_str().unwrap_or_default().to_owned())
+                .collect();
+            (loc.join("."), i["type"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("body.options.resize".to_owned(), "bool_type".to_owned()),
+            ("body.options.crop".to_owned(), "extra_forbidden".to_owned())
+        ]
+    );
+
+    // A derived model's PARAMETER resize is the default; the request's option wins over it.
+    let r = http()
+        .post(d.url("/api/create"))
+        .body(json!({"model": "frames", "from": "laya:en", "parameters": {"precision": "fp32", "resize": false}}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let _ = r.text().await.unwrap();
+    let show = d.client.show("frames").await.unwrap();
+    assert_eq!(show.parameters, "precision fp32\nresize false");
+    assert!(show.modelfile.contains("PARAMETER resize false"));
+    let frames = |extra: Value| {
+        let mut b = json!({"model": "frames", "state": state, "questions": q});
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b.to_string()
+    };
+    let (_, _, v) = post_raw(&d.url("/api/decide"), frames(json!({}))).await;
+    assert_eq!(v["detail"][0]["type"], "image_size", "{v}");
+    let (status, _, v) = post_raw(
+        &d.url("/api/decide"),
+        frames(json!({"options": {"resize": true}})),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    let (_, _, v) = post_raw(
+        &d.url("/api/create"),
+        json!({"model": "bad", "from": "laya:en", "parameters": {"resize": "no"}}).to_string(),
+    )
+    .await;
+    assert_eq!(v["detail"][0]["type"], "parameter", "{v}");
+    d.stop().await;
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("runner") {
@@ -1129,6 +1241,7 @@ fn main() {
         queue_bound_and_cancellation,
         pull_streams_ndjson,
         create_copy_delete,
+        options_and_image_issues,
     ];
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (mut passed, mut failed) = (0, Vec::new());
