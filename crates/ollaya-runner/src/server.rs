@@ -8,14 +8,16 @@
 //! * On startup, after the model is loaded, the runner prints one JSON line to stdout:
 //!   `{"port":<u16>,"device":"cuda:0"|"cpu","precision":"fp16"|"fp32"}`.
 //! * `GET /health` -> the same object plus `"status":"ok"`.
-//! * `POST /decide` `{state, questions}` ->
+//! * `POST /decide` `{state, questions, options?}` ->
 //!   `{questions:[{logits, act_logits}], input_tokens, state_tokens, state_truncated}`.
-//!   Errors are `{"error":{"code","message"}}` with status 400 (bad request) or 500.
+//!   `options` is [`RunOptions`] (`{"resize": bool}`).
+//!   Errors are `{"error":{"code","message"}}` with status 400 (bad request) or 500. A bad image
+//!   adds `"detail": [<validation issue>]`, which the daemon returns as it is.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -25,7 +27,11 @@ use serde_json::{Value, json};
 
 use crate::engine::{self, Engine};
 use crate::onnx::{Device, ModelFiles};
-use crate::{Error, QuestionOutput};
+use crate::{Error, QuestionOutput, RunOptions};
+
+/// Largest `/decide` body. Only the daemon calls the runner, and it has already applied its own
+/// request limit; the runner re-serializes the same request, so this only needs to be above it.
+const MAX_DECIDE_BODY: usize = 256 * 1024 * 1024;
 
 /// Which device to try. `Auto` prefers CUDA and falls back to CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +79,8 @@ pub struct Loaded {
 struct DecideRequest {
     state: Value,
     questions: Value,
+    #[serde(default)]
+    options: RunOptions,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +229,7 @@ pub async fn run(config: RunnerConfig) -> Result<(), Error> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/decide", post(decide))
+        .layer(DefaultBodyLimit::max(MAX_DECIDE_BODY))
         .with_state(state);
     axum::serve(listener, app)
         .await
@@ -234,7 +243,7 @@ async fn health(State(s): State<Arc<AppState>>) -> Json<Value> {
 async fn decide(State(s): State<Arc<AppState>>, Json(req): Json<DecideRequest>) -> Response {
     let result = tokio::task::spawn_blocking(move || -> Result<Value, Error> {
         let questions = ollaya_decision::parse_questions(&req.questions)?;
-        let out = s.model.run(&req.state, &questions)?;
+        let out = s.model.run_with(&req.state, &questions, &req.options)?;
         let questions: Vec<QuestionLogits> = out
             .questions
             .into_iter()
@@ -256,6 +265,15 @@ async fn decide(State(s): State<Arc<AppState>>, Json(req): Json<DecideRequest>) 
                 "code": "TOO_MANY_OPTIONS",
                 "message": format!("question {question:?}: {options} options exceed the model's option budget"),
                 "question": question, "options": options, "head_max_len": head_max_len,
+            }})),
+        )
+            .into_response(),
+        Ok(Err(Error::Decision(ollaya_decision::Error::Image(issue)))) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {
+                "code": "INVALID_REQUEST",
+                "message": issue.to_string(),
+                "detail": [issue],
             }})),
         )
             .into_response(),
